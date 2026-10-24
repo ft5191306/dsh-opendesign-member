@@ -1,0 +1,13 @@
+# Dependencies (this plugin has none by design, but a future change might)
+node_modules/
+
+# Test and editor noise
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# This plugin's own runtime state, if anyone ever runs it in place
+*.pid

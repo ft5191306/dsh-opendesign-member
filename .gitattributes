@@ -1,0 +1,13 @@
+# Keep line endings stable across the Windows host this was built on and any
+# other platform it gets cloned to. Source stays LF in the repo; git normalises
+# on checkout so a Windows editor cannot introduce CRLF churn into every commit.
+* text=auto eol=lf
+
+# PowerShell is the one exception: run in place it likes CRLF, and diffs of
+# inline scripts are unreadable when the whole file is one line-ending change.
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+
+# Artwork and the icon are binary from git's point of view.
+*.svg text
+*.png binary
