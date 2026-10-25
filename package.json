@@ -16,14 +16,16 @@
     "client.js",
     "cordis.patch.yml",
     "lib/*.js",
+    "scripts/*.js",
+    "docs/*.md",
     "locale/*.json",
     "icon.svg",
     "README.md",
     "AGENTS.md"
   ],
   "scripts": {
-    "test": "node --test \"test/*.test.js\"",
-    "check": "node --check index.js && node --check client.js && node --check lib/od-client.js && node --check lib/bindings.js && node --check lib/settings.js && node --check lib/tool.js && node --check lib/sidecar-token.js"
+    "test": "node scripts/test.js",
+    "check": "node scripts/check.js"
   },
   "dsh": {
     "bundle": {

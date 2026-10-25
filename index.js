@@ -35,17 +35,28 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { defineTool } from './lib/tool.js';
 import {
-  discoverDaemon, OdClient, awaitRun, readInbound, splitQuestionForm,
+  discoverDaemon, OdClient, awaitRun, isTerminalRun, readInbound, splitQuestionForm,
   renderQuestionForm, composeFormAnswers, OdError,
 } from './lib/od-client.js';
 import { mintImportToken } from './lib/sidecar-token.js';
 import { BindingStore } from './lib/bindings.js';
 import { SettingsStore, resolveSelection, DEFAULT_MODEL } from './lib/settings.js';
+import { planTurn, composeRunMessage } from './lib/turn-plan.js';
+import { reconcileWatch, isSettledRun } from './lib/watch.js';
+import { observeRun, diffConversation } from './lib/conversation-watch.js';
+import { describeActions } from './lib/turn-actions.js';
 
 /** Cordis plugin name. */
 export const name = 'opendesign-member';
 
-/** Services required before this plugin can activate. */
+/**
+ * Services required before this plugin can activate.
+ *
+ * `jobs` is NOT listed: it is an optional service imported with `ctx.get('jobs')`
+ * at the point of use, so the bridge still loads in a composition that has no
+ * background-job registry. Requiring it would make the whole plugin unavailable
+ * just because one feature has nowhere to run.
+ */
 export const inject = ['tools', 'systemPrompt', 'agentTeams', 'agents', 'workingDirectory'];
 
 /**
@@ -107,7 +118,15 @@ const DEFAULTS = {
   // Ten minutes is already generous for one design turn. Callers that truly need
   // longer pass `timeout_ms` on that one call instead of raising this default.
   turnTimeoutMs: 600_000,
-  instructions: '',
+  /**
+   * How often a background watcher polls Open Design, in milliseconds.
+   *
+   * Five seconds is chosen against the cost measured on this host: one status poll
+   * is a local HTTP call plus a `getRun`, so it is cheap enough to leave running
+   * for hours, and fast enough that a status change reaches the job output while
+   * the Lead is still reading the previous line.
+   */
+  watchIntervalMs: 5_000,  instructions: '',
   storePath: 'opendesign-member/bindings.json',
   // The plugin-level model settings document the Plugin Manager page edits.
   // Separate from the Team bindings on purpose: that page has no Session, so it
@@ -136,6 +155,7 @@ function resolveConfig(raw) {
     sessionMode: text('sessionMode').trim() || DEFAULTS.sessionMode,
     pollMs: Math.max(200, number('pollMs')),
     turnTimeoutMs: Math.max(0, number('turnTimeoutMs')),
+    watchIntervalMs: Math.max(500, number('watchIntervalMs')),
     instructions: text('instructions'),
     storePath: text('storePath').trim() || DEFAULTS.storePath,
     settingsPath: text('settingsPath').trim() || DEFAULTS.settingsPath,
@@ -233,6 +253,13 @@ Reading the result of \`opendesign_ask\`:
 - Answer it with \`opendesign_ask({ form_answers: [{ id, label?, value }] })\`, using the ids and values the form reported. Open Design then treats those answers as authoritative and will not re-ask them.
 - If the decision is yours to make, answer with the option Open Design marked as its default, or pass a decision of your own.
 - When you want Open Design to stop asking and proceed on its own judgment, say so plainly in the next \`opendesign_ask\` prompt (for example "Skip discovery; proceed with your defaults").
+- \`actions\` reports what the turn actually DID: \`toolCalls\`, the tool \`tools\` it used, and \`wrote\` when it changed files. Read it when a reply reads like a plan — a turn can be building while its prose sounds like a proposal.
+
+WHO BUILDS IT — this is the one that gets misread, so it is stated plainly:
+- **Open Design is the implementer, not an adviser.** It writes the files in this workspace. Your job is to brief it, answer its questions, and verify what it delivered. Do not write the frontend implementation yourself.
+- **A plan is not permission for you to start.** When a turn comes back with a proposal and NO \`questionForm\`, that is not "confirmed, now I build it" — it is Open Design waiting to be told to go. The next move is always another \`opendesign_ask\`: "Go ahead and build it as described", or the change you want first. Answering a form and then writing the page yourself produces two implementations of one design and wastes the turn you just paid for.
+- If you catch yourself planning file writes, SVG coordinates, or "how I will build this", stop: those belong in a prompt to Open Design, not in your own tool calls.
+- What IS yours: writing the brief, choosing between options only the human owns, and verifying the delivered result (running the app, looking at it). Verifying is not implementing.
 
 Requirements for every task that involves frontend or UI work:
 1. Do at least one alignment round before asking for work: state what the thing is for and let Open Design answer. Alignment is a conversation about intent, not a spec hand-off.
@@ -252,7 +279,14 @@ Do not hand Open Design the acceptance-testing labour. Starting servers, waiting
 When a turn keeps working past your wait:
 - A result with \`stillRunning: true\` means Open Design is STILL WORKING, not that it failed. The turn was not cancelled and its output is not lost.
 - Do not re-send the request and do not treat it as an error: collect the answer with \`opendesign_ask({ run_id })\` using that runId. Repeated collection calls are safe while it is still running.
-- Only a cancellation from the human stops the turn. Never kill a design turn because it is slow.`;
+- If you no longer have the runId, \`opendesign_status\` reports the run that member left in progress, with the exact call that collects it. Use that instead of asking again.
+- Only a cancellation from the human stops the turn. Never kill a design turn because it is slow.
+
+Redirecting a turn that is already running:
+- \`opendesign_ask({ inject })\` STOPS that turn and starts a new one with this text. That is what Open Design's own 「引导对话」 does — verified against the live app: the running turn is cancelled (\`cancel_origin: user_stop\`) and a new run starts with the prior context. It is not a mid-turn message; Open Design cannot deliver one on this CLI.
+- Nothing is written to the conversation for the injected text beyond the new run's own user message, so the instruction appears once.
+- The unfinished work of the stopped turn is lost. The result carries \`interrupted.answerSoFar\`, which is what that turn had produced, so you can see what was traded.
+- To keep the old turn running instead, collect it with \`opendesign_ask({ run_id })\` and send the new direction afterwards as an ordinary prompt.`;
 }
 
 /** One compact output declaration: JSON text plus the canonical value. */
@@ -316,6 +350,61 @@ const ASK_SCHEMA = {
      * Never read this as a failure, and never quote it as an answer.
      */
     stillRunning: { type: 'boolean' },
+    /**
+     * Present when this call started nothing because a turn was ALREADY running
+     * in that conversation. Reports which run it found and how to collect it, so
+     * the caller can attach instead of waiting on a run that will never answer.
+     */
+    adopted: {
+      oneOf: [
+        { type: 'object', additionalProperties: true },
+        { type: 'null' },
+      ],
+    },
+    /**
+     * The watcher armed for this conversation: `{ jobId, reused }`. Read its lines
+     * with `job_output`, stop it with `job_kill`. `reused: true` means one was
+     * already running, since arming is idempotent per conversation.
+     */
+    watcher: {
+      oneOf: [
+        { type: 'object', additionalProperties: true },
+        { type: 'null' },
+      ],
+    },
+    /**
+     * What the turn actually DID: `{ toolCalls, tools, wrote, read, summary }`.
+     * `wrote` means it changed files. Absent when the journal could not be read —
+     * "unknown" is never reported as "did nothing".
+     */
+    actions: {
+      oneOf: [
+        { type: 'object', additionalProperties: true },
+        { type: 'null' },
+      ],
+    },
+    /**
+     * Present when a stale run had to be stopped so form answers could be
+     * delivered as their own turn. Form answers are a reply to a question, not a
+     * new request, so they are never held back by the busy guard.
+     */
+    answeredOverRun: {
+      oneOf: [
+        { type: 'object', additionalProperties: true },
+        { type: 'null' },
+      ],
+    },
+    /**
+     * Present only when this call stopped a turn to redirect it.
+     * `answerSoFar` is what that turn had produced before it was cut off, so the
+     * cost of the redirect is visible instead of silent.
+     */
+    interrupted: {
+      oneOf: [
+        { type: 'object', additionalProperties: true },
+        { type: 'null' },
+      ],
+    },
   },
 };
 
@@ -330,13 +419,64 @@ const STATUS_SCHEMA = {
     /** Empty object when this Team has not opened a project yet. */
     project: { type: 'object', additionalProperties: true },
     members: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    /**
+     * The live verdict on this member's conversation: `state` is `busy` or
+     * `idle`, and a busy verdict carries the run id plus the exact call that
+     * collects it. Reconciled from three independent observations, so it stays
+     * right even when this bridge's own record is missing.
+     */
+    watch: { type: 'object', additionalProperties: true },
+    /**
+     * The run this member left in progress, or null. Present so a run whose
+     * answer was never collected can be found again after the caller lost its id.
+     *
+     * Declared with `oneOf` because the tool-output schema subset has no
+     * "nullable" spelling: `type` may sit beside `oneOf`, but a plain
+     * `type: 'object'` rejects a null that means something real.
+     */
+    pendingRun: {
+      oneOf: [
+        { type: 'object', additionalProperties: true },
+        { type: 'null' },
+      ],
+    },
+    /**
+     * Whether this CLI accepts a message mid-turn; null when not yet known.
+     * It is informational only: redirection does not rely on it, because the
+     * measured behaviour on this CLI is cancel-and-restart, not mid-turn input.
+     */
+    steering: {
+      oneOf: [
+        { type: 'object', additionalProperties: true },
+        { type: 'null' },
+      ],
+    },
     workspace: { type: 'string' },
     configuredModel: { type: 'string' },
     configuredAgentId: { type: 'string' },
     alignments: { type: 'object', additionalProperties: true },
   },
 };
-
+const WATCH_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['member', 'conversationId', 'jobId', 'intervalMs', 'watch', 'note'],
+  properties: {
+    member: { type: 'string' },
+    /**
+     * The conversation being watched. Empty on the first call when the binding is
+     * not on disk yet: the job resolves it on its own first tick, so this call
+     * never waits for the daemon. The job output then names it.
+     */
+    conversationId: { type: 'string' },
+    /** Id of the background job. Read it with job_output, stop it with job_kill. */
+    jobId: { type: 'string' },
+    intervalMs: { type: 'integer' },
+    /** The exact calls that read and stop this watcher. */
+    watch: { type: 'string' },
+    note: { type: 'string' },
+  },
+};
 const INBOX_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -430,10 +570,12 @@ export function apply(ctx, rawConfig = {}) {
    * immediately instead of after a cache expires.
    *
    * @param od - connected client.
+   * @param prefetchedAppConfig - an already-read `app-config`, so one call can
+   *   identify the CLI without issuing the same request twice.
    * @returns `{ agentId, appConfig }`.
    */
-  async function currentCli(od) {
-    const appConfig = await od.appConfig();
+  async function currentCli(od, prefetchedAppConfig) {
+    const appConfig = prefetchedAppConfig ?? await od.appConfig();
     const selected = typeof appConfig?.agentId === 'string' && appConfig.agentId.length > 0
       ? appConfig.agentId
       : undefined;
@@ -445,6 +587,32 @@ export function apply(ctx, rawConfig = {}) {
       );
     }
     return { agentId, appConfig };
+  }
+
+  /**
+   * Read one CLI's catalogue from memory or disk WITHOUT touching the daemon.
+   *
+   * This is the cheap half of {@link catalogue}: a hot path such as
+   * `opendesign_status` needs to know "does this CLI have models, and is it
+   * available" without paying nine seconds for `/api/agents`. A cache miss here
+   * is reported as "not known yet", never as "no models".
+   *
+   * @param agentId - CLI the catalogue belongs to.
+   * @param now - current time in ms.
+   * @returns `{ at, data }` or undefined when no fresh copy is on hand.
+   */
+  function cachedCatalogue(agentId, now) {
+    if (catalogueCache !== undefined
+      && catalogueCache.agentId === agentId
+      && now - catalogueCache.at < CATALOGUE_TTL_MS) {
+      return { at: catalogueCache.at, data: catalogueCache.data };
+    }
+    const saved = readCatalogueCache(agentId, now);
+    if (saved !== undefined) {
+      catalogueCache = { at: saved.at, agentId, data: saved.data };
+      return saved;
+    }
+    return undefined;
   }
 
   /**
@@ -467,7 +635,7 @@ export function apply(ctx, rawConfig = {}) {
    *
    * @param od - connected client.
    * @param input - the CLI id, plus `force` to re-probe regardless of the cache.
-   * @returns `{ providers, entries, agentId, agentName, agentAvailable }`.
+   * @returns `{ providers, entries, agentId, agentName, agentAvailable, promptInputFormat }`.
    */
   async function catalogue(od, input) {
     const { agentId } = input;
@@ -475,17 +643,11 @@ export function apply(ctx, rawConfig = {}) {
     // Memory first, then disk: the disk copy is what makes a ten-second probe a
     // once-per-CLI cost instead of a once-per-restart cost.
     if (input.force !== true) {
-      if (catalogueCache !== undefined
-        && catalogueCache.agentId === agentId
-        && now - catalogueCache.at < CATALOGUE_TTL_MS) {
-        return catalogueCache.data;
-      }
-      const saved = readCatalogueCache(agentId, now);
-      if (saved !== undefined) {
-        catalogueCache = { at: saved.at, agentId, data: saved.data };
-        return saved.data;
-      }
+      const cached = cachedCatalogue(agentId, now);
+      if (cached !== undefined) return cached.data;
     }
+    // `agents` is the expensive check, so this probe skips paying for it twice:
+    // the enumeration itself is the call right below.
     const agents = await od.listAgents();
     const agent = agents.find((entry) => entry.id === agentId);
     const entries = [];
@@ -519,6 +681,19 @@ export function apply(ctx, rawConfig = {}) {
       agentId,
       agentName: agent?.name ?? agentId,
       agentAvailable: agent?.available === true,
+      /**
+       * The runtime's input format, kept because it is the ONLY thing that
+       * decides whether a mid-turn message is possible: Open Design accepts one
+       * solely when this is `stream-json` (every other runtime closes the child's
+       * stdin with the opening prompt, so a later write goes nowhere and the
+       * steer route answers 409 `RUN_STEERING_UNSUPPORTED`).
+       *
+       * Stored here rather than read fresh because it lives in `GET /api/agents`,
+       * the 9–11 s call: a status check must not pay that to learn one property
+       * of one CLI. It changes only when the human switches CLI, which this cache
+       * is already keyed on.
+       */
+      promptInputFormat: typeof agent?.promptInputFormat === 'string' ? agent.promptInputFormat : '',
     };
     catalogueCache = { at: now, data };
     writeCatalogueCache(agentId, now, data);
@@ -657,6 +832,132 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /**
+   * Read the run id a project says it is executing, if any.
+   *
+   * Open Design keeps a per-project `status.runId`, and it is the one observation
+   * that survives BOTH a lost bridge record AND a conversation whose assistant row
+   * has not been written yet — the window where a caller concludes "nothing is
+   * happening" while a turn is streaming.
+   *
+   * Note the asymmetry, verified against the live daemon: the LIST route carries
+   * `status`, the single-project route does NOT. Reading `GET /projects/:id` and
+   * looking for `status` silently yields nothing, which would make this guard look
+   * implemented while never firing.
+   *
+   * @param od - connected client.
+   * @param projectId - the Team's project.
+   */
+  async function liveProjectRun(od, projectId) {
+    const projects = await od.listProjects();
+    const project = projects.find((entry) => entry?.id === projectId);
+    const status = project?.status;
+    const runId = typeof status?.runId === 'string' ? status.runId : undefined;
+    if (runId === undefined || runId.length === 0) return undefined;
+    const value = typeof status?.value === 'string' ? status.value : undefined;
+    // A project can keep a stale runId after the run settled; the value is the
+    // field that says which state it is in.
+    if (value !== undefined && /^(succeeded|failed|canceled|cancelled|error|timeout|idle|done)$/i.test(value)) {
+      return undefined;
+    }
+    return { runId, status: value };
+  }
+
+  /**
+   * Find a run that is still live in one conversation, whatever started it.
+   *
+   * Open Design does not serialise ordinary chat turns, so this is the only
+   * defence against two runs interleaving their history in one conversation. It
+   * deliberately looks at the CONVERSATION rather than at this bridge's own
+   * records: the turn that matters may have been started by a previous bridge
+   * process, or by the human in the Open Design window.
+   *
+   * Bounded on purpose — it reads the recent assistant rows rather than every
+   * message, and gives up quietly. A guard that fails must not block the caller's
+   * actual request, so "could not tell" reports nothing and lets the turn start.
+   *
+   * @param od - connected client.
+   * @param projectId - the Team's project.
+   * @param conversationId - the member's conversation.
+   * @param ignore - run ids the caller already handles explicitly.
+   * @returns `{ runId, status, text }` for the newest live run, or undefined.
+   */
+  async function findLiveRun(od, projectId, conversationId, ignore = []) {
+    const skip = new Set(ignore.filter((id) => typeof id === 'string' && id.length > 0));
+    let messages;
+    try {
+      messages = await od.listMessages(projectId, conversationId);
+    } catch {
+      return undefined;
+    }
+    // Newest first: the turn worth reporting is the most recent one.
+    const runs = [];
+    for (const message of [...messages].reverse()) {
+      if (message?.role !== 'assistant') continue;
+      if (typeof message?.runId !== 'string' || message.runId.length === 0) continue;
+      if (skip.has(message.runId)) continue;
+      if (runs.includes(message.runId)) continue;
+      runs.push(message.runId);
+      if (runs.length >= 5) break;
+    }
+    for (const runId of runs) {
+      let run;
+      try {
+        run = await od.getRun(runId);
+      } catch {
+        // Cannot tell; do not block the caller on a failed lookup.
+        continue;
+      }
+      if (run === undefined || isTerminalRun(run)) continue;
+      const assistant = messages.find((message) => message?.id === run.assistantMessageId);
+      return {
+        runId,
+        status: typeof run.status === 'string' ? run.status : 'running',
+        text: typeof assistant?.content === 'string' ? assistant.content : '',
+      };
+    }
+    return undefined;
+  }
+
+  /**
+   * Report whether this CLI can accept a message mid-turn — and never more.
+   *
+   * Open Design's own criterion (`agentSupportsMidTurnSteering` in its daemon) is
+   * `promptInputFormat === 'stream-json'`: every other runtime closes the child's
+   * stdin together with the opening prompt, so a later write goes nowhere and
+   * `POST /runs/:id/steer` answers 409 `RUN_STEERING_UNSUPPORTED`. Its own source
+   * comment says clients must stop advertising the affordance rather than retry.
+   *
+   * Read from the cached catalogue, never from `GET /api/agents`: that call takes
+   * 9–11 s for one property of one CLI, and this answer is requested on the
+   * injection path where the whole point is to react immediately.
+   *
+   * `supported: null` means "not known yet" (cold cache) — never `false`, which
+   * would state a capability the bridge has not checked.
+   *
+   * @param agentId - the CLI to describe.
+   */
+  function steeringCapabilityFromCache(agentId) {
+    const cached = cachedCatalogue(agentId, Date.now());
+    if (cached === undefined) {
+      return {
+        supported: null,
+        agentId,
+        reason: 'the model catalogue has not been probed yet, so the input format is unknown; open the plugin settings page once, or pass include_models to opendesign_status',
+      };
+    }
+    const format = typeof cached.data.promptInputFormat === 'string' ? cached.data.promptInputFormat : '';
+    const supported = format === 'stream-json';
+    return {
+      supported,
+      agentId,
+      inputFormat: format,
+      reason: supported
+        ? `CLI ${agentId} keeps its input open mid-turn (promptInputFormat: stream-json)`
+        : `CLI ${agentId} does not accept a mid-turn message (promptInputFormat: ${format === '' ? '""' : format}). Redirecting a running turn therefore stops it and starts a new one, which is what Open Design's own 「引导对话」 does on this CLI.`,
+    };
+  }
+
+  /**
    * Serve the settings route the browser half uses.
    *
    * Deliberately registered on `connection.fetch`, NOT on `webServer.register`.
@@ -780,7 +1081,11 @@ export function apply(ctx, rawConfig = {}) {
       }
     }
 
-    const report = await od.probe();
+    // Only version and capability gaps are wanted here, and both come from cheap
+    // routes. The `agents` enumeration is skipped: it costs 9–11 s, and a project
+    // binding needs nothing from it — the CLI is resolved per turn from
+    // `app-config`, not from this report.
+    const report = await od.probe({ skip: ['agents'] });
     const projectId = teamProjectId(teamId);
     const desiredName = `DSH Team ${String(teamId).slice(0, 8)}`;
     const instructions = config.instructions.trim();
@@ -906,6 +1211,124 @@ export function apply(ctx, rawConfig = {}) {
     return { binding, reused: false };
   }
 
+  /** Watchers already armed, keyed by `<owner session>:<conversation id>`. */
+  const armed = new Map();
+
+  /**
+   * Start one long-lived watcher job for a conversation, or return the one already
+   * running for it.
+   *
+   * Why this is not only the `opendesign_watch` tool: a job lives inside the DSH
+   * process, so a DSH restart silently takes every watcher with it and nothing
+   * restarts them until somebody remembers to call the tool again. Measured — the
+   * watcher was reported as "not started" while `job_list` was simply empty after a
+   * restart. So `opendesign_ask` arms a watcher as part of the turn it is already
+   * running: the turn and the thing watching it start together, which is the
+   * behaviour a caller wants and cannot forget to ask for.
+   *
+   * IDEMPOTENT, in the sense that matters: calling this twice for one conversation
+   * yields exactly one running job and the same id. That requires checking the
+   * recorded job is still ALIVE rather than merely remembered — `armed` is process
+   * memory, and a job can be killed or reaped while the map still names it.
+   * Returning a dead id would be worse than starting a second watcher: the caller
+   * would poll `job_output` forever and see nothing, which is precisely the failure
+   * this whole feature exists to remove.
+   *
+   * @param input.jobs - the background registry; callers without one get nothing.
+   * @param input.owner - the session that owns the job.
+   * @param input.od - connected Open Design client.
+   * @param input.projectId - the Team's project.
+   * @param input.conversationId - the conversation to watch.
+   * @param input.member - member name, for the job label.
+   * @param input.intervalMs - poll cadence.
+   * @returns `{ jobId, reused }`, or undefined when watching is unavailable.
+   */
+  function armWatcher(input) {
+    const { jobs } = input;
+    if (jobs === undefined) return undefined;
+    const key = `${input.owner}:${input.conversationId}`;
+
+    // Reuse ONLY a job that is still live. `jobs.get` throws for an unknown or
+    // foreign id, which is exactly the stale case that must restart.
+    const recorded = armed.get(key);
+    if (recorded !== undefined) {
+      let live = false;
+      try {
+        const view = jobs.get(recorded, input.owner);
+        live = view?.status === 'running' || view?.status === 'stopping';
+      } catch {
+        live = false;
+      }
+      if (live) return { jobId: recorded, reused: true };
+      // Remembered but gone: forget it so the new id replaces it.
+      armed.delete(key);
+    }
+
+    const intervalMs = Number.isFinite(input.intervalMs) ? input.intervalMs : config.watchIntervalMs;
+    const { projectId, conversationId, member, od } = input;
+    let previous;
+    let lastProblem;
+
+    const jobId = jobs.start({
+      kind: 'bash',
+      label: `opendesign-watch ${member} ${String(conversationId).slice(0, 8)}`,
+      owner: input.owner,
+      run: (job) => {
+        let stopped = false;
+        const loop = (async () => {
+          job.append(`watching ${member} conversation ${conversationId} every ${intervalMs}ms\n`);
+          while (!stopped) {
+            try {
+              const run = await findLiveRun(od, projectId, conversationId).catch(() => undefined);
+              const projectRun = run === undefined
+                ? await liveProjectRun(od, projectId).catch(() => undefined)
+                : undefined;
+              const live = run ?? projectRun;
+              const observation = observeRun(
+                live === undefined
+                  ? undefined
+                  : await od.getRun(live.runId).catch(() => ({ id: live.runId, status: live.status })),
+                undefined,
+              );
+              const report = diffConversation(previous, observation);
+              if (report.changed) {
+                job.append(`${new Date().toISOString()} ${report.kind}: ${report.message}\n`);
+                job.updateProgress(report.message);
+                // A status change means the caller should look at the output.
+                if (observation.runId !== undefined) {
+                  job.append(`  → check the output: opendesign_ask({ run_id: "${observation.runId}" })\n`);
+                }
+              }
+              previous = observation;
+              if (lastProblem !== undefined) {
+                job.append(`${new Date().toISOString()} recovered\n`);
+                lastProblem = undefined;
+              }
+            } catch (error) {
+              // One line per distinct problem, and the client is KEPT: it carries
+              // `rediscover`, which repairs a port change inside the next request.
+              const detail = error instanceof Error ? error.message : String(error);
+              if (detail !== lastProblem) {
+                lastProblem = detail;
+                job.append(`${new Date().toISOString()} not ready yet: ${detail}\n`);
+              }
+            }
+            await new Promise((resolve) => setTimeout(resolve, intervalMs));
+          }
+          return { status: 'completed' };
+        })();
+        return {
+          done: loop,
+          cancel: () => {
+            stopped = true;
+          },
+        };
+      },
+    });
+    armed.set(key, jobId);
+    return { jobId, reused: false };
+  }
+
   /**
    * Run one Open Design turn and return only its final text.
    *
@@ -939,16 +1362,50 @@ export function apply(ctx, rawConfig = {}) {
     const reasoning = typeof input.reasoning === 'string' && input.reasoning.length > 0
       ? input.reasoning
       : (stored.reasoning || config.reasoning);
-    const accepted = await od.createRun({
-      projectId: input.projectId,
-      conversationId: input.conversationId,
-      agentId,
-      message: `[${input.sender}]\n\n${input.prompt}`,
-      model,
-      ...(reasoning ? { reasoning } : {}),
-      clientRequestId: `dsh-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-      ...(input.sessionMode ? { sessionMode: input.sessionMode } : {}),
-    });
+    let accepted;
+    try {
+      accepted = await od.createRun({
+        projectId: input.projectId,
+        conversationId: input.conversationId,
+        agentId,
+        // The sender prefix is added once, HERE, for a normal turn. A consuming
+        // turn sends the injected row's own text, which already carries it, so
+        // prefixing again would double it. `composeRunMessage` owns that rule and
+        // has its own test: this was a real bug, caught by reading the conversation
+        // the feature had just written into.
+        message: composeRunMessage({
+          sender: input.sender,
+          prompt: input.prompt,
+          userMessageId: input.userMessageId,
+        }),
+        // Set only when this turn consumes an injected message: the row already
+        // exists in the conversation, so the daemon adopts it rather than seeding a
+        // second copy of the same words.
+        ...(input.userMessageId ? { userMessageId: input.userMessageId } : {}),
+        model,
+        ...(reasoning ? { reasoning } : {}),
+        clientRequestId: `dsh-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        ...(input.sessionMode ? { sessionMode: input.sessionMode } : {}),
+      });
+    } catch (error) {
+      // A conversation that already owns a live run answers 409 RUN_IN_PROGRESS.
+      // Passing that through verbatim tells the caller nothing it can act on, so
+      // say which run to attach to and how — that is the whole difference between
+      // a dead end and a usable answer.
+      if (error instanceof OdError && error.details?.status === 409) {
+        const live = await findLiveRun(od, input.projectId, input.conversationId).catch(() => undefined);
+        if (live !== undefined) {
+          throw new OdError(
+            `a turn is already running in this conversation (run ${live.runId}, status ${live.status}). `
+            + `Collect it with opendesign_ask({ run_id: "${live.runId}" }), or stop it deliberately with opendesign_ask({ inject: ... }). `
+            + `Starting a second turn would interleave their history in one conversation.`,
+            'conversation-busy',
+            { runId: live.runId, status: live.status },
+          );
+        }
+      }
+      throw error;
+    }
     const runId = accepted.runId;
     if (typeof runId !== 'string') {
       throw new OdError('Open Design did not accept the turn', 'run-create-failed', { accepted });
@@ -1057,7 +1514,7 @@ export function apply(ctx, rawConfig = {}) {
       register(scoped.tools.register(defineTool({
         name: 'opendesign_ask',
         description:
-          'Ask Open Design one question and return ONLY that turn\'s final answer. This is how you consult the Team\'s frontend/UI specialist. Intermediate streaming output is never returned. Runs in the caller\'s own Open Design window unless `member` selects another member\'s window. Brief it in two parts: describe the need subjectively (intent, audience, tone, impression) and constrain with objective facts (stack, file layout, component/API interfaces, data schemas, formats).',
+          'Run one Open Design turn and return ONLY that turn\'s final answer. Open Design is this Team\'s frontend implementer: it writes the files, and you brief it rather than building the UI yourself. Intermediate streaming output is never returned. Runs in the caller\'s own Open Design window unless `member` selects another member\'s window. Brief it in two parts: describe the need subjectively (intent, audience, tone, impression) and constrain with objective facts (stack, file layout, component/API interfaces, data schemas, formats). A reply with prose and no `questionForm` is a proposal waiting for you to say "go ahead" — send that as another turn; it does not hand the work to you.',
         parameters: {
           prompt: {
             type: 'string',
@@ -1082,6 +1539,11 @@ export function apply(ctx, rawConfig = {}) {
           run_id: {
             type: 'string',
             description: 'Collect the answer of a run that was still working when you stopped waiting. Pass the runId from a stillRunning result; do not send a prompt with it.',
+          },
+          inject: {
+            type: 'string',
+            description:
+              'Redirect a turn that is already running. This STOPS that turn and starts a new one with this text, which is what Open Design\'s own 「引导对话」 does — verified against the live app: the running turn is cancelled (cancel_origin: user_stop) and a new run starts with the prior context. The unfinished work of the stopped turn is lost, and the result reports where it had got to. Open Design cannot accept a message into a turn in flight on this CLI, so a "mid-turn steer" is not something this bridge can offer. To keep the old turn running instead, send this as a normal prompt after collecting it.',
           },
           form_answers: {
             type: 'array',
@@ -1108,13 +1570,129 @@ export function apply(ctx, rawConfig = {}) {
             ? args.timeout_ms
             : config.turnTimeoutMs;
 
-          // Resuming a run that outlived our wait is a READ, not a new turn:
-          // Open Design is already producing the answer, so sending anything here
-          // would start a second turn on top of it.
-          const resumeRunId = typeof args.run_id === 'string' && args.run_id.length > 0
-            ? args.run_id
+          // Submitting form answers is a distinct shape: Open Design only treats
+          // the message as authoritative when it opens with the exact
+          // `[form answers — id]` header its designer prompt defines.
+          const answers = Array.isArray(args.form_answers) && args.form_answers.length > 0
+            ? args.form_answers
             : undefined;
-          if (resumeRunId !== undefined) {
+          const remembered = store.member(member.root.id, targetMember)?.pendingForm;
+
+          // What this call means is decided by `planTurn`, a pure function with
+          // its own tests: collect / inject / run / error. Everything below is I/O.
+          //
+          // Why the distinction matters: an injected message can never reach the
+          // turn already running (measured — the turn finished with its original
+          // answer, mentioning none of the correction), so pretending otherwise
+          // would make every later status report a lie.
+          const recordedPendingRun = store.pendingRun(member.root.id, targetMember);
+          // Ask the daemon what this conversation is actually doing, instead of
+          // trusting this bridge's own record. The record is written only when a
+          // wait expires, so it is blind to a turn the human started in the Open
+          // Design window, to a turn started before a plugin reload, and to any
+          // turn whose write was lost. Three observations are reconciled first;
+          // `reconcileWatch` owns that decision and has its own tests.
+          let pendingRunStatus;
+          if (recordedPendingRun?.runId !== undefined) {
+            pendingRunStatus = await od.getRun(recordedPendingRun.runId).catch(() => undefined);
+            // Only a DEFINITE terminal status clears the record. A failed lookup
+            // is not evidence of settlement: while a long turn streams, this
+            // daemon can time out on `GET /api/runs/:id`, and dropping the record
+            // then loses the only pointer to a live run.
+            if (pendingRunStatus !== undefined && isSettledRun(pendingRunStatus)) {
+              store.clearPendingRun(member.root.id, targetMember);
+            }
+          }
+          const conversationRun = await findLiveRun(od, ensured.project.projectId, binding.conversationId, [
+            recordedPendingRun?.runId,
+          ]).catch(() => undefined);
+          const projectRun = await liveProjectRun(od, ensured.project.projectId).catch(() => undefined);
+          const watch = reconcileWatch({
+            pendingRun: recordedPendingRun,
+            pendingRunStatus,
+            conversationRun,
+            projectRun,
+            activeRunCount: await od.activeRunCount(),
+          });
+          // `pendingRunActive` is what the planner needs: true / false / unknown.
+          const pendingRunActive = recordedPendingRun?.runId === undefined
+            ? undefined
+            : (pendingRunStatus === undefined
+              ? undefined
+              : !isSettledRun(pendingRunStatus));
+          const plan = planTurn({
+            runId: args.run_id,
+            inject: args.inject,
+            prompt: answers !== undefined
+              ? composeFormAnswers(
+                args.form_id ?? remembered?.id ?? 'form',
+                answers.map((answer) => ({
+                  id: answer?.id,
+                  label: answer?.label,
+                  value: answer?.value,
+                })),
+              )
+              : args.prompt,
+            hasFormAnswers: answers !== undefined,
+            pendingRun: recordedPendingRun,
+            pendingRunActive,
+          });
+
+          // ── interrupt: stop the live turn, then run the text as the next ──
+          //
+          // This mirrors Open Design's own 「引导对话」, measured on 2026-10-25:
+          // pressing it with a turn running produced a new run while the old one
+          // was still working, wrote NO user message for the typed text, and left
+          // the old run with `cancel_origin: user_stop`.
+          //
+          // The cost is real and is reported rather than hidden: the stopped turn
+          // loses whatever it had not finished. `interrupted.answerSoFar` carries
+          // the prose it had produced, so the caller can see what was traded.
+          let interrupted;
+          if (plan.interruptRunId !== undefined) {
+            // Read the turn's partial output BEFORE cancelling: after the run
+            // settles the daemon keeps the assistant message, but reporting what
+            // was lost is only honest if it is captured from what actually
+            // existed at the moment of the stop.
+            const partial = await od.getRun(plan.interruptRunId)
+              .then((run) => (run?.projectId && run?.conversationId && run?.assistantMessageId
+                ? od.listMessages(run.projectId, run.conversationId)
+                  .then((messages) => messages.find((message) => message?.id === run.assistantMessageId))
+                  .catch(() => undefined)
+                : undefined))
+              .catch(() => undefined);
+            const partialText = typeof partial?.content === 'string' ? partial.content : '';
+
+            const before = await od.getRun(plan.interruptRunId).catch(() => undefined);
+            if (before !== undefined && !isTerminalRun(before)) {
+              await od.cancelRun(plan.interruptRunId).catch(() => undefined);
+              // Wait for the cancel to land before starting the replacement:
+              // two live runs in one conversation interleave their history, and
+              // the daemon does not gate ordinary chat turns against that.
+              for (let i = 0; i < 40; i += 1) {
+                const now = await od.getRun(plan.interruptRunId).catch(() => undefined);
+                if (now === undefined || isTerminalRun(now)) break;
+                await new Promise((resolve) => setTimeout(resolve, config.pollMs));
+              }
+            }
+            const settled = await od.getRun(plan.interruptRunId).catch(() => undefined);
+            const capped = truncateUtf8(partialText, MAX_ANSWER_BYTES);
+            interrupted = {
+              runId: plan.interruptRunId,
+              // The daemon's own verdict on how the run ended, so "was it really
+              // stopped?" is answered by the daemon rather than by this bridge.
+              status: typeof settled?.status === 'string' ? settled.status : 'unknown',
+              cancelOrigin: typeof settled?.cancelOrigin === 'string' ? settled.cancelOrigin : null,
+              /** What the stopped turn had produced before it was cut off. */
+              answerSoFar: capped.text,
+              answerTruncated: capped.truncated,
+            };
+            store.clearPendingRun(member.root.id, targetMember);
+          }
+
+          // ── collect: a READ of an existing run, sending nothing ───────────
+          if (plan.kind === 'collect') {
+            const resumeRunId = plan.runId;
             const collected = await awaitRun(od, resumeRunId, {
               pollMs: config.pollMs,
               timeoutMs: budget,
@@ -1162,30 +1740,95 @@ export function apply(ctx, rawConfig = {}) {
             };
           }
 
-          // Submitting form answers is a distinct shape: Open Design only treats
-          // the message as authoritative when it opens with the exact
-          // `[form answers — id]` header its designer prompt defines.
-          const answers = Array.isArray(args.form_answers) && args.form_answers.length > 0
-            ? args.form_answers
-            : undefined;
-          const remembered = store.member(member.root.id, targetMember)?.pendingForm;
-          const prompt = answers !== undefined
-            ? composeFormAnswers(
-              args.form_id ?? remembered?.id ?? 'form',
-              answers.map((answer) => ({
-                id: answer?.id,
-                label: answer?.label,
-                value: answer?.value,
-              })),
-            )
-            : args.prompt;
-
-          if (typeof prompt !== 'string' || prompt.trim().length === 0) {
+          if (plan.kind === 'error') {
             const pending = remembered === undefined
-              ? 'no question form is outstanding for this member'
-              : `Open Design is waiting for answers to "${remembered.title ?? remembered.id}" (form_id ${remembered.id})`;
-            throw new Error(`opendesign_ask needs prompt or form_answers: ${pending}.`);
+              ? ''
+              : ` Open Design is still waiting for answers to "${remembered.title ?? remembered.id}" (form_id ${remembered.id}).`;
+            throw new Error(`opendesign_ask has nothing to do: ${plan.reason}.${pending}`);
           }
+
+          const prompt = plan.prompt;
+
+          // Guard the conversation before adding a run to it.
+          //
+          // This is the check that used to be missing. Open Design does not gate
+          // ordinary chat turns (`ordinary chat turns are never gated by this` in
+          // `handleRunCreate`), and the strategy-task path that DOES answer 409
+          // only covers projects created with a strategy task. So a turn started
+          // outside this bridge — by the human in the Open Design window, or by a
+          // bridge process whose record was lost — was invisible here, and this
+          // call would start a second one over it.
+          //
+          // `watch` has already reconciled every source. When it says a turn is
+          // live, that turn wins: report it and how to collect it instead of
+          // starting another.
+          //
+          // EXCEPT when this call carries FORM ANSWERS. Those are not a new
+          // request: they are the reply to a question Open Design is blocked on,
+          // and dropping them strands the conversation. `watch.busy` can also be
+          // a false positive — an unreadable recorded run counts as busy by
+          // design — so a guard that refused to deliver answers would turn a
+          // conservative guess into a lost reply. Measured: after the guard was
+          // added, form answers never reached Open Design at all, and the same
+          // form came back on the next turn.
+          if (watch.busy === true && plan.answersReply !== true) {
+            return {
+              member: targetMember,
+              conversationId: binding.conversationId,
+              model: 'default',
+              status: watch.status,
+              answer: '',
+              questionForm: '',
+              truncated: false,
+              runId: watch.runId,
+              durationMs: 0,
+              stillRunning: true,
+              // Nothing new was started; this is the turn already in progress.
+              adopted: {
+                runId: watch.runId,
+                source: watch.source,
+                reason: 'a turn is already running in this conversation, and starting a second one would interleave their history',
+                collectWith: watch.collectWith,
+              },
+              ...(watch.note === undefined ? {} : { note: watch.note }),
+            };
+          }
+
+          // A form answer is a reply to a turn that ended by asking. If a run is
+          // somehow still live in the conversation, delivering the answer alongside
+          // it would put two runs in one history — so stop the stale one first.
+          // Never cancel for a plain prompt: that case is handled by the guard
+          // below, which reports instead of destroying work.
+          let answeredOverRun;
+          if (answers !== undefined && watch.busy === true) {
+            await od.cancelRun(watch.runId).catch(() => undefined);
+            for (let i = 0; i < 40; i += 1) {
+              const now = await od.getRun(watch.runId).catch(() => undefined);
+              if (now === undefined || isSettledRun(now)) break;
+              await new Promise((resolve) => setTimeout(resolve, config.pollMs));
+            }
+            const stopped = await od.getRun(watch.runId).catch(() => undefined);
+            answeredOverRun = {
+              runId: watch.runId,
+              status: typeof stopped?.status === 'string' ? stopped.status : 'unknown',
+              cancelOrigin: typeof stopped?.cancelOrigin === 'string' ? stopped.cancelOrigin : null,
+              note: 'this turn was stopped so the form answers could be delivered as their own turn',
+            };
+          }
+
+          // Arm the watcher BEFORE the turn starts, so it is watching from the
+          // first moment the run exists instead of being something a caller has to
+          // remember. It is armed here rather than inside `runTurn` because this is
+          // where the job registry and the session owner are both in scope.
+          const armedWatcher = armWatcher({
+            jobs: typeof ctx.get === 'function' ? ctx.get('jobs') : undefined,
+            owner: exec.agent.session.id,
+            od,
+            projectId: ensured.project.projectId,
+            conversationId: binding.conversationId,
+            member: targetMember,
+            intervalMs: config.watchIntervalMs,
+          });
 
           const settled = await runTurn(od, {
             projectId: ensured.project.projectId,
@@ -1246,6 +1889,11 @@ export function apply(ctx, rawConfig = {}) {
               runId: settled.runId,
               durationMs: settled.settledAt - settled.startedAt,
               stillRunning: true,
+              ...(interrupted === undefined ? {} : { interrupted }),
+              ...(answeredOverRun === undefined ? {} : { answeredOverRun }),
+              // Most useful on this path: the caller has stopped waiting, and the
+              // watcher is how it finds out the turn finished.
+              ...(armedWatcher === undefined ? {} : { watcher: armedWatcher }),
             };
           }
           if (!settled.ok && capped.text.length === 0 && settled.questionForm === null) {
@@ -1271,6 +1919,24 @@ export function apply(ctx, rawConfig = {}) {
             runId: settled.runId,
             durationMs: settled.settledAt - settled.startedAt,
             stillRunning: false,
+            // Present only when this call stopped a turn to redirect it, so the
+            // caller can see exactly what was traded away for the new direction.
+            ...(interrupted === undefined ? {} : { interrupted }),
+            // Present only when a stale run had to be stopped so form answers
+            // could be delivered as their own turn.
+            ...(answeredOverRun === undefined ? {} : { answeredOverRun }),
+            // The watcher armed for this conversation, so the caller knows where to
+            // read status changes after this call returns.
+            ...(armedWatcher === undefined ? {} : { watcher: armedWatcher }),
+            // What the turn actually DID, from its own journal. A reply that reads
+            // like a proposal can be a run that already changed files, and the caller
+            // needs that fact rather than an inference from the prose.
+            ...(settled.actions === undefined ? {} : {
+              actions: {
+                ...settled.actions,
+                summary: describeActions(settled.actions),
+              },
+            }),
           };
         },
       })));
@@ -1278,10 +1944,15 @@ export function apply(ctx, rawConfig = {}) {
       register(scoped.tools.register(defineTool({
         name: 'opendesign_status',
         description:
-          'Report the Open Design bridge state: daemon reachability and version, capability gaps, every member conversation binding, workspace alignment, and the model in use. Use it to verify alignment before and after either client upgrades.',
-        parameters: {},
+          'Report the Open Design bridge state cheaply: daemon reachability and version, capability gaps, how many runs Open Design currently has active, every member conversation binding including any run still in progress, workspace alignment, and the model in use. Use it to verify alignment before and after either client upgrades, and to find a run whose answer has not been collected yet. The model catalogue is kept out of this answer because reading it costs Open Design nine seconds; pass include_models for it, or read the settings panel, which caches it.',
+        parameters: {
+          include_models: {
+            type: 'boolean',
+            description: 'Include the selected CLI\'s model ids. Off by default: this reads the daemon\'s full model catalogue, which takes seconds and duplicates the cached catalogue the settings panel already holds.',
+          },
+        },
         output: jsonOutput(STATUS_SCHEMA),
-        async execute(_args, exec) {
+        async execute(args, exec) {
           const member = membership(exec.agent);
           // Read-only: peekTeam never creates a record, and no setter runs here,
           // so inspecting state cannot rewrite the bindings file.
@@ -1291,37 +1962,138 @@ export function apply(ctx, rawConfig = {}) {
           let activeCli;
           try {
             const od = await client();
-            const report = await od.probe();
+            // `agents` is ALWAYS skipped here, for two different reasons that
+            // happen to agree:
+            //   - off (default): it costs 9–11 s against a 60 KB response, and
+            //     every ALIGNMENT rule tells members to call this tool before UI
+            //     work. A status call that blocks that long makes alignment the
+            //     slowest step of the task it was meant to unblock.
+            //   - on: the enumeration is about to be done by `catalogue(force)`
+            //     below, and asking twice is precisely the duplicate that made the
+            //     old status call nineteen seconds instead of nine. Measured after
+            //     the first attempt at this fix: probe + listAgents = 18.1 s on the
+            //     opt-in path, because both still ran.
+            const report = await od.probe({
+              skip: ['agents'],
+              capture: ['appConfig', 'activeRunCount'],
+            });
             // Report the CLI Open Design has selected right now, which is what a
-            // turn would drive — not a pinned id from config.
-            const cli = await currentCli(od);
+            // turn would drive — not a pinned id from config. Reads the same
+            // `app-config` body the probe just captured.
+            const cli = await currentCli(od, report.features.appConfig?.value?.config);
             activeCli = cli.agentId;
-            const agents = await od.listAgents().catch(() => []);
-            const agentDef = agents.find((entry) => entry.id === activeCli);
+            // Availability and the model list come from the per-CLI catalogue
+            // that is already cached on disk (7-day TTL), so this path normally
+            // costs no daemon call at all. A cold cache reports "unknown" rather
+            // than a false "unavailable".
+            const cached = cachedCatalogue(activeCli, Date.now());
             const odModel = odSelection(cli.appConfig, activeCli);
+            const activeRunCount = report.features.activeRunCount?.value?.activeRunCount;
             daemon = {
               reachable: true,
               baseUrl: report.baseUrl,
               version: report.version,
               degraded: report.degraded,
-              agentAvailable: agentDef?.available === true,
-              agentVersion: agentDef?.version ?? null,
+              /** Runs Open Design is executing right now, across every client. */
+              activeRunCount: Number.isFinite(activeRunCount) ? activeRunCount : null,
+              agentAvailable: cached === undefined ? null : cached.data.agentAvailable === true,
               // What Open Design itself stores for this CLI, so a divergence from
               // this side's settings is visible here too.
               odModel: odModel?.model ?? null,
               odReasoning: odModel?.reasoning ?? null,
-              models: (agentDef?.models ?? []).map((entry) => entry.id).slice(0, 40),
+              /** When the cached catalogue was probed, or null when none is on hand. */
+              catalogueAt: cached === undefined ? null : new Date(cached.at).toISOString(),
             };
+            if (args.include_models === true) {
+              // Explicitly asked for: pay for the real enumeration. `force` beats
+              // the cache so the answer reflects the daemon as it is now.
+              //
+              // A failure here is reported as this ONE field, never by turning the
+              // whole report into "unreachable": the daemon just answered five
+              // cheap routes, so claiming it is down because its most expensive
+              // route timed out would send the caller looking for the wrong
+              // problem. That is also what a busy single-threaded daemon looks
+              // like mid-turn, which is exactly when a member checks on it.
+              try {
+                const fresh = await catalogue(od, { agentId: activeCli, force: true });
+                daemon.agentAvailable = fresh.agentAvailable;
+                daemon.agentName = fresh.agentName;
+                daemon.modelCount = fresh.entries.length;
+                daemon.models = fresh.entries.map((entry) => entry.id).slice(0, 40);
+                daemon.catalogueAt = new Date().toISOString();
+              } catch (error) {
+                daemon.modelsError = error instanceof Error ? error.message : String(error);
+              }
+            }
           } catch (error) {
             daemon = { reachable: false, error: error instanceof Error ? error.message : String(error) };
           }
           const workspace = ctx.workingDirectory.get(exec.agent.session);
+          // A run this member left in progress. Reported at top level rather than
+          // under `daemon`, because it is this Team's bookkeeping, not daemon state:
+          // it is what makes such a run collectable after the caller lost its id.
+          const pendingRun = team.members?.[member.name]?.pendingRun;
+          // What Open Design is ACTUALLY doing in this member's conversation,
+          // reconciled from the recorded run, the conversation, and the project's
+          // own status. This is the field that answers "is it working, or did my
+          // turn die?" without guessing from `pendingRun`, which is only written
+          // when a wait expires and is therefore blind to runs this bridge did not
+          // start.
+          const watched = await (async () => {
+            const od = await client().catch(() => undefined);
+            if (od === undefined) {
+              return {
+                state: 'unknown',
+                busy: null,
+                note: 'the daemon is not reachable, so what it is doing cannot be observed',
+              };
+            }
+            const memberConversation = team.members?.[member.name]?.conversationId;
+            const projectId = team.project?.projectId;
+            const conversationRun = projectId && memberConversation
+              ? await findLiveRun(od, projectId, memberConversation, [pendingRun?.runId]).catch(() => undefined)
+              : undefined;
+            return reconcileWatch({
+              pendingRun,
+              pendingRunStatus: pendingRun?.runId === undefined
+                ? undefined
+                : await od.getRun(pendingRun.runId).catch(() => undefined),
+              conversationRun,
+              projectRun: projectId ? await liveProjectRun(od, projectId).catch(() => undefined) : undefined,
+              activeRunCount: Number.isFinite(daemon.activeRunCount) ? daemon.activeRunCount : undefined,
+            });
+          })();
           return {
             member: member.name,
             role: member.role,
             daemon,
             project: team.project ?? {},
             members: Object.values(team.members),
+            /**
+             * The live verdict: `state` is `busy` or `idle`, and a busy verdict
+             * carries the run id plus `collectWith`. Replaces guessing from
+             * `pendingRun` alone.
+             */
+            watch: watched,
+            pendingRun: pendingRun === undefined
+              ? null
+              : {
+                runId: pendingRun.runId,
+                startedAt: pendingRun.startedAt,
+                notedAt: pendingRun.at,
+                // Collected with the same call shape that started it. Spelled out
+                // because "there is a pending run" is useless without the key.
+                collectWith: pendingRun.runId === undefined
+                  ? null
+                  : `opendesign_ask({ run_id: "${pendingRun.runId}" })`,
+              },
+            /**
+             * Whether this CLI can take a message mid-turn. `null` means not yet
+             * known (cold catalogue cache). Informational: redirecting a turn does
+             * not depend on it, because the measured behaviour here is
+             * cancel-and-restart rather than mid-turn input.
+             */
+            steering: activeCli === undefined ? null : await steeringCapabilityFromCache(activeCli),
             workspace,
             configuredModel: settings.current().model || config.model || 'runtime default',
             configuredAgentId: activeCli ?? (config.agentId || 'Open Design current CLI'),
@@ -1334,6 +2106,86 @@ export function apply(ctx, rawConfig = {}) {
         },
       })));
 
+      register(scoped.tools.register(defineTool({
+        name: 'opendesign_watch',
+        description:
+          'Start a LONG-LIVED background watcher on this member\'s Open Design conversation, and report its job id. It keeps running after this tool call returns and after the calling turn ends, polling the run status and appending a line to its job output every time that status CHANGES — queued, running, succeeded, failed, canceled. Read the lines with job_output. Stop it with job_kill. This is how you find out that a turn you stopped waiting for has finished: the job outlives the call that started it, which a per-call wait cannot.',
+        parameters: {
+          member: {
+            type: 'string',
+            description: 'Watch this Team member\'s conversation instead of your own.',
+          },
+          interval_ms: {
+            type: 'integer',
+            description: 'How often to poll Open Design, in milliseconds. Defaults to the configured watch interval (5s). Slower is cheaper; faster only shortens the delay before a change is noticed.',
+          },
+          stop_when_idle: {
+            type: 'boolean',
+            description: 'When true, the watcher stops itself once the conversation has had no live run for one full interval after having seen one. Default false: it keeps watching so a turn started later is still noticed.',
+          },
+        },
+        output: jsonOutput(WATCH_SCHEMA),
+        async execute(args, exec) {
+          const member = membership(exec.agent);
+          const targetMember = typeof args.member === 'string' && args.member.length > 0
+            ? args.member
+            : member.name;
+          const intervalMs = typeof args.interval_ms === 'number' && args.interval_ms >= 500
+            ? args.interval_ms
+            : config.watchIntervalMs;
+
+          // `jobs` is optional: a composition without a background registry still
+          // gets a usable answer instead of a crash, and the note says what to do.
+          const jobs = typeof ctx.get === 'function' ? ctx.get('jobs') : undefined;
+          if (jobs === undefined) {
+            throw new Error(
+              'background watching needs the jobs service, which this composition does not provide. '
+              + 'Poll with opendesign_status instead, or collect the run directly with opendesign_ask({ run_id }).',
+            );
+          }
+
+          const workspace = ctx.workingDirectory.get(exec.agent.session);
+          const owner = exec.agent.session.id;
+          // The conversation is resolved ONCE, from disk when possible, so the job
+          // can start immediately. Doing `client()` + `ensureProject()` +
+          // `ensureConversation()` first — all daemon round-trips, and `client()`
+          // alone scans every port while Open Design is cold or down — meant the
+          // watcher appeared to start late or not at all: the very moment it is
+          // most needed is the moment those calls are slowest.
+          // Resolved from disk so this call never waits for the daemon. An
+          // unbound conversation is not an error here: the job reports it and
+          // keeps trying, which is what a watcher should do.
+          const recorded = store.member(member.root.id, targetMember);
+          const projectId = recorded?.projectId;
+          const conversationId = recorded?.conversationId;
+
+          // The one and only watcher implementation, shared with `opendesign_ask`
+          // so both share a single idempotency rule: one live job per
+          // conversation, and a remembered-but-dead job is restarted rather than
+          // reported as running.
+          const armedWatcher = armWatcher({
+            jobs,
+            owner: exec.agent.session.id,
+            od: await client(),
+            projectId,
+            conversationId,
+            member: targetMember,
+            intervalMs,
+          });
+
+          return {
+            member: targetMember,
+            // Empty when the member has no bound conversation yet.
+            conversationId: conversationId ?? '',
+            jobId: armedWatcher.jobId,
+            intervalMs,
+            watch: `long-lived: read its lines with job_output({ job_id: "${armedWatcher.jobId}" }), stop it with job_kill({ job_id: "${armedWatcher.jobId}" })`,
+            note: armedWatcher.reused
+              ? 'A watcher was already running for this conversation and is reused — one job per conversation, so its output has no duplicated lines.'
+              : 'The job is running now and keeps polling after this call returns. It only READS Open Design, so a restarted daemon costs a retry rather than a provisioning wait. Every run-status change is appended to its output.',
+          };
+        },
+      })));
       register(scoped.tools.register(defineTool({
         name: 'opendesign_inbox',
         description:
