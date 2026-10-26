@@ -14,6 +14,27 @@ import os from 'node:os';
 import path from 'node:path';
 
 /**
+ * The directory throwaway test state is created in.
+ *
+ * Defaults to `os.tmpdir()`, which is correct everywhere the tests are supposed to
+ * run. `DSH_TEST_TMP` exists because some hosts — measured on the Windows box this
+ * plugin was developed on — deny `Node` any write inside `%TEMP%` while allowing a
+ * normal user process to write there. The failure is an `EPERM` from `mkdtemp`, and
+ * it arrives as seventeen unrelated-looking test failures, which is exactly the
+ * shape a real regression would also take.
+ *
+ * The override is deliberately OPT-IN and has no fallback: silently retrying in a
+ * second location would turn "this host cannot write temp" into a permanent blind
+ * spot, and a guard that can pass when it should not is worse than none.
+ */
+export function tempRoot() {
+  const override = process.env.DSH_TEST_TMP;
+  return typeof override === 'string' && override.trim().length > 0
+    ? override.trim()
+    : os.tmpdir();
+}
+
+/**
  * Run one body against a throwaway directory, removing it afterwards.
  *
  * Every persistence helper in this plugin takes an absolute file path, so tests
@@ -23,7 +44,7 @@ import path from 'node:path';
  * @param body - receives the directory path and a function to build paths inside it.
  */
 export async function withTempDir(body) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'odm-test-'));
+  const dir = fs.mkdtempSync(path.join(tempRoot(), 'odm-test-'));
   try {
     return await body({
       dir,

@@ -245,6 +245,7 @@ window.__ModuleLoader__.load({
       const [failure, setFailure] = React.useState(undefined);
       const [pending, setPending] = React.useState(false);
       const [refreshing, setRefreshing] = React.useState(false);
+      const [panelFailure, setPanelFailure] = React.useState(undefined);
 
       const load = React.useCallback(async (force) => {
         if (force === true) setRefreshing(true);
@@ -368,6 +369,40 @@ window.__ModuleLoader__.load({
               t('state.cached')),
           ]),
         ]),
+        // Opens the right-bar tab this bundle registers. Kept here because this
+        // page is where a human configures the bridge; the tab itself is opened
+        // from the right Sidebar's guide once.
+        h('div', { key: 'panel', style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } }, [
+          h('button', {
+            key: 'open',
+            type: 'button',
+            disabled: pending,
+            onClick: () => {
+              setPanelFailure(undefined);
+              // The controller throws when no Session is on screen (or the
+              // composition has no right Sidebar). Report that instead of doing
+              // nothing, which reads as a dead button.
+              Promise.resolve(props.openPanel?.()).then((reason) => {
+                if (typeof reason === 'string' && reason.length > 0) setPanelFailure(reason);
+              }).catch((error) => setPanelFailure(error instanceof Error ? error.message : String(error)));
+            },
+            style: {
+              padding: '0 10px',
+              height: '26px',
+              borderRadius: '6px',
+              border: '1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.32))',
+              background: 'transparent',
+              color: 'var(--dsw-alias-label-primary, inherit)',
+              fontSize: '12.5px',
+              cursor: 'pointer',
+            },
+          }, t('action.openPanel')),
+          panelFailure === undefined ? null : h('span', {
+            key: 'failure',
+            role: 'alert',
+            style: { fontSize: '12px', color: 'var(--dsw-alias-state-error-primary, #d9534f)' },
+          }, panelFailure),
+        ]),
         band === undefined ? null : h(StatusBand, { key: 'band', tone: band.tone, text: band.text, action: band.action }),
         // Provider first: it decides which models the next row may offer.
         h(Row, { key: 'provider', label: t('row.provider') }, h(Select, {
@@ -413,6 +448,257 @@ window.__ModuleLoader__.load({
       ]);
     }
 
+    /**
+     * The right Sidebar tab this bundle owns.
+     *
+     * Open Design's real window is an Electron view on the `od://` scheme, which
+     * a browser cannot load. Open Design 0.26.1 also runs a web sidecar that
+     * serves the SAME product UI over plain HTTP — that page is what this tab
+     * frames, and the Host locates it because its port is ephemeral.
+     */
+    const TAB_KIND = 'opendesign';
+    /** Tab-type identity in the right Sidebar, and the key its body registers under. */
+    const TAB_ID = PACKAGE_NAME;
+    /** Host route the panel reads its state through (read-only by construction). */
+    const PANEL_ENDPOINT = '/api/opendesign-member/panel';
+
+    /**
+     * Read the Host's panel snapshot for one Session.
+     *
+     * Same envelope and same honesty rule as the settings route: a failure is a
+     * reason string the panel can show, never a swallowed error that leaves a
+     * blank frame behind.
+     */
+    async function readPanel(sessionId, refresh) {
+      const query = new URLSearchParams();
+      if (typeof sessionId === 'string' && sessionId.length > 0) query.set('session', sessionId);
+      if (refresh === true) query.set('refresh', '1');
+      const suffix = query.size === 0 ? '' : `?${query.toString()}`;
+      let response;
+      try {
+        response = await fetch(`${PANEL_ENDPOINT}${suffix}`, {
+          headers: { accept: 'application/json' },
+          credentials: 'same-origin',
+        });
+      } catch (error) {
+        return { ok: false, error: `cannot reach the Harness Host: ${error instanceof Error ? error.message : String(error)}` };
+      }
+      const payload = await response.json().catch(() => undefined);
+      if (payload === undefined || typeof payload !== 'object') {
+        return { ok: false, error: `the Harness Host answered HTTP ${response.status} with a body that is not JSON` };
+      }
+      if (payload.ok !== true) {
+        return { ok: false, error: payload.error?.message ?? `the Harness Host rejected the call (HTTP ${response.status})` };
+      }
+      return { ok: true, value: payload.value };
+    }
+
+    /**
+     * The one URL a browser can frame: the web sidecar's origin, plus the deep
+     * link the Host reports when it knows one.
+     *
+     * Returns undefined when there is no origin at all; callers must explain the
+     * absence instead of framing an empty page.
+     */
+    function panelSrc(value) {
+      const base = String(value?.web?.baseUrl ?? '').replace(/\/+$/, '');
+      if (base.length === 0) return undefined;
+      const deep = value?.web?.deepLink;
+      if (typeof deep === 'string' && deep.length > 0) {
+        return `${base}${deep.startsWith('/') ? '' : '/'}${deep}`;
+      }
+      return `${base}/`;
+    }
+
+    const panelRootStyle = {
+      display: 'flex',
+      flexDirection: 'column',
+      height: '100%',
+      minHeight: 0,
+      background: 'var(--dsw-alias-bg-layer-1, transparent)',
+    };
+
+    const panelBarStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      padding: '6px 10px',
+      flex: '0 0 auto',
+      flexWrap: 'wrap',
+      borderBottom: '1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.24))',
+      fontSize: '12px',
+      color: 'var(--dsw-alias-label-secondary, inherit)',
+    };
+
+    const panelNoteStyle = {
+      padding: '12px',
+      fontSize: '12.5px',
+      lineHeight: '19px',
+      whiteSpace: 'pre-wrap',
+      color: 'var(--dsw-alias-label-secondary, inherit)',
+    };
+
+    const panelErrorStyle = { ...panelNoteStyle, color: 'var(--dsw-alias-state-error-primary, #d9534f)' };
+
+    const panelButtonStyle = {
+      padding: '0 8px',
+      height: '22px',
+      borderRadius: '5px',
+      border: '1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.32))',
+      background: 'transparent',
+      color: 'var(--dsw-alias-label-secondary, inherit)',
+      fontSize: '12px',
+      cursor: 'pointer',
+    };
+
+    const panelFrameStyle = {
+      flex: '1 1 auto',
+      minHeight: 0,
+      width: '100%',
+      border: '0',
+      background: '#fff',
+    };
+
+    /**
+     * A small control in the tab's top strip: reload the iframe, re-probe the
+     * Host, or open the product's own window. Buttons rather than text because
+     * every one of these is a real user action.
+     */
+    function PanelButton({ label, onClick, disabled }) {
+      return h('button', {
+        type: 'button',
+        disabled: disabled === true,
+        onClick,
+        style: { ...panelButtonStyle, opacity: disabled === true ? 0.6 : 1 },
+      }, label);
+    }
+
+    /**
+     * The tab body: frame the Open Design web app when — and only when — the
+     * Host proves it is both present and furable.
+     *
+     * Every state is named on screen. The failure the product must never show is
+     * a silently blank iframe: a user would conclude Open Design is broken when
+     * in fact a capability is missing or forbidden.
+     */
+    function PanelBody(props) {
+      const t = props.t ?? ((key) => key);
+      const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined;
+      const [state, setState] = React.useState({ phase: 'loading' });
+      const [nonce, setNonce] = React.useState(0);
+      /**
+       * The Host's monotonic "Open Design state changed" counter. A change means
+       * the background watcher saw real activity (a turn appeared/settled, a run
+       * was collected), which is the signal to reload the embedded frame so the
+       * human sees it without clicking anything.
+       */
+      const revisionRef = React.useRef(undefined);
+
+      const load = React.useCallback(async (refresh) => {
+        const result = await readPanel(sessionId, refresh === true);
+        if (!result.ok) {
+          setState({ phase: 'failed', error: result.error });
+          return;
+        }
+        const value = result.value;
+        const previousRevision = revisionRef.current;
+        if (previousRevision !== undefined
+          && typeof value?.revision === 'number'
+          && value.revision !== previousRevision) {
+          // Reload the frame (not just the panel): the embedded page is what shows
+          // the new run/answer, and it cannot know the Host changed on its own.
+          setNonce((current) => current + 1);
+        }
+        revisionRef.current = value?.revision;
+        setState({ phase: 'ready', value });
+      }, [sessionId]);
+
+      React.useEffect(() => { void load(false); }, [load]);
+
+      // Two-second re-probe, doing three jobs at once: it keeps the tab honest
+      // across an Open Design restart (the sidecar's port moves), it picks up the
+      // watcher's revision bumps, and it auto-retries a failed discovery instead
+      // of leaving the sidebar dead until the human presses a button.
+      React.useEffect(() => {
+        const timer = setInterval(() => { void load(false); }, 2_000);
+        return () => clearInterval(timer);
+      }, [load]);
+
+      if (state.phase === 'loading') {
+        return h('div', { style: panelRootStyle }, h('div', { style: panelNoteStyle }, t('panel.loading')));
+      }
+
+      if (state.phase === 'failed') {
+        return h('div', { style: panelRootStyle }, [
+          h('div', { key: 'note', style: panelErrorStyle }, `${t('panel.failed')}\n${state.error}\n\n${t('panel.retrying')}`),
+          h('div', { key: 'actions', style: { padding: '0 12px 12px' } },
+            h(PanelButton, { label: t('action.retry'), onClick: () => { void load(true); } })),
+        ]);
+      }
+
+      const value = state.value;
+      const src = panelSrc(value);
+      const bar = h('div', { style: panelBarStyle }, [
+        h('span', { key: 'member', style: { flex: '1 1 auto' } },
+          value.member === null || value.member === undefined
+            ? t('panel.noMember')
+            : t('panel.member').replace('{name}', String(value.member))),
+        value.web?.stale === true ? h('span', {
+          key: 'stale',
+          title: typeof value.web.reason === 'string' ? value.web.reason : undefined,
+          style: { color: 'var(--dsw-alias-state-warn-primary, #d9a441)' },
+        }, t('panel.stale')) : null,
+        src === undefined ? null : h(PanelButton, {
+          key: 'reload',
+          label: t('panel.reload'),
+          onClick: () => {
+            setNonce((current) => current + 1);
+            void load(true);
+          },
+        }),
+      ]);
+
+      if (src === undefined || value.web?.embeddable !== true) {
+        const details = [
+          t('panel.notEmbeddable'),
+          typeof value.web?.reason === 'string' && value.web.reason.length > 0 ? value.web.reason : undefined,
+          value.daemon?.reachable === false ? `${t('panel.daemonDown')}\n${value.daemon.error ?? ''}` : undefined,
+          t('panel.bridgeHint'),
+        ].filter((line) => typeof line === 'string' && line.length > 0).join('\n\n');
+        // A blocked frame is still a working page: open it as a normal tab so the
+        // user is never left with only an explanation.
+        const externalUrl = src ?? (typeof value.web?.baseUrl === 'string' && value.web.baseUrl.length > 0
+          ? `${String(value.web.baseUrl).replace(/\/+$/, '')}/`
+          : undefined);
+        return h('div', { style: panelRootStyle }, [
+          bar,
+          h('div', { key: 'note', style: panelNoteStyle, 'aria-live': 'polite' }, details),
+          h('div', { key: 'actions', style: { display: 'flex', gap: '8px', padding: '0 12px 12px' } }, [
+            h(PanelButton, { key: 'retry', label: t('action.retry'), onClick: () => { void load(true); } }),
+            externalUrl === undefined ? null : h(PanelButton, {
+              key: 'external',
+              label: t('panel.openExternal'),
+              onClick: () => { window.open(externalUrl, '_blank', 'noopener'); },
+            }),
+          ]),
+        ]);
+      }
+
+      return h('div', { style: panelRootStyle }, [
+        bar,
+        h('iframe', {
+          key: `frame:${src}:${nonce}`,
+          src,
+          title: t('tab.title'),
+          style: panelFrameStyle,
+          // A local, first-party product UI: no sandbox attribute, because the
+          // app is the same trust domain as the app it belongs to and its own
+          // scripts/routes must work exactly as in a normal tab.
+          allow: 'clipboard-read; clipboard-write',
+        }),
+      ]);
+    }
+
     return {
       inject: ['slots', 'locale'],
       apply(ctx) {
@@ -440,6 +726,22 @@ window.__ModuleLoader__.load({
             'action.retry': '重试',
             'action.refresh': '重新读取',
             'action.refreshing': '读取中…',
+            'action.openPanel': '在右栏打开 Open Design',
+            'tab.title': 'Open Design',
+            'guide.title': 'Open Design 窗口',
+            'guide.description': '把 Open Design 的网页版窗口嵌在右栏，和对话并排。',
+            'panel.loading': '正在查找 Open Design 窗口…',
+            'panel.failed': '读不到面板状态。',
+            'panel.retrying': '会自动重试，也可以手动重试。',
+            'panel.stale': '地址可能已过期',
+            'panel.reload': '重新载入',
+            'panel.member': '成员：{name}',
+            'panel.noMember': '当前会话不是 Team 成员会话，不知道要显示谁的窗口。',
+            'panel.notEmbeddable': '无法把 Open Design 嵌进这里：',
+            'panel.openExternal': '在浏览器新标签打开',
+            'panel.daemonDown': 'Open Design 的守护进程当前不可达。',
+            'panel.bridgeHint': '桥接工具不受影响；Open Design 自己的原生窗口请到桌面应用里查看。',
+            'panel.unavailable': '当前界面没有右侧栏，或没有选中会话，无法打开面板。',
           },
           en: {
             'section.title': 'Runtime model',
@@ -464,10 +766,45 @@ window.__ModuleLoader__.load({
             'action.retry': 'Retry',
             'action.refresh': 'Refresh',
             'action.refreshing': 'Reading…',
+            'action.openPanel': 'Open Open Design in the right bar',
+            'tab.title': 'Open Design',
+            'guide.title': 'Open Design window',
+            'guide.description': 'The Open Design web window, embedded in the right bar next to the conversation.',
+            'panel.loading': 'Looking for the Open Design window…',
+            'panel.failed': 'The panel state could not be read.',
+            'panel.retrying': 'It retries automatically, or use the button.',
+            'panel.stale': 'address may be stale',
+            'panel.reload': 'Reload',
+            'panel.member': 'Member: {name}',
+            'panel.noMember': 'This is not a Team member session, so there is no member window to show.',
+            'panel.notEmbeddable': 'Open Design cannot be embedded here:',
+            'panel.openExternal': 'Open in a browser tab',
+            'panel.daemonDown': 'The Open Design daemon is not reachable right now.',
+            'panel.bridgeHint': 'The bridge tools are unaffected; see the Open Design desktop app for its own window.',
+            'panel.unavailable': 'This UI has no right sidebar, or no Session is selected, so the panel cannot be opened.',
           },
         }), 'opendesign-member: dictionaries');
 
         const t = ctx.locale.bind(NS);
+
+        /**
+         * Open this bundle's right-bar tab, or report why that is impossible.
+         *
+         * The controller throws when no Session is on screen (the column is
+         * Session-keyed) or when this composition has no right Sidebar. A button
+         * that silently does nothing is the failure mode to avoid, so the reason
+         * travels back to the caller to be shown.
+         */
+        const openPanel = async () => {
+          const sidebarRight = ctx.get('sidebarRight');
+          if (typeof sidebarRight?.openTab !== 'function') return t('panel.unavailable');
+          try {
+            sidebarRight.openTab(TAB_KIND);
+            return undefined;
+          } catch (error) {
+            return error instanceof Error ? error.message : String(error);
+          }
+        };
 
         ctx.slots.inject('plugins.detail.section', () => ctx.slots.register({
           name: 'plugins.detail.section',
@@ -475,7 +812,35 @@ window.__ModuleLoader__.load({
           order: 20,
           locale: NS,
           label: () => t('section.title'),
-        }, (props) => h(ModelSettingsSection, { ...props, t })));
+        }, (props) => h(ModelSettingsSection, { ...props, t, openPanel })));
+
+        // Optional capability: register the right-bar tab only where the right
+        // Sidebar exists. Its absence must cost the panel, never the whole
+        // browser half — the model settings above stay usable regardless.
+        ctx.inject(['sidebarRight', 'sidebarRightTabs'], (scoped) => {
+          const tabs = scoped.get('sidebarRightTabs');
+          if (typeof tabs?.register !== 'function') return;
+          scoped.effect(() => tabs.register({
+            id: TAB_ID,
+            kind: TAB_KIND,
+            // Outside the product: the highest ranking band, so a future
+            // builtin of the same kind would not take this one over silently.
+            priority: 'extension',
+            title: () => t('tab.title'),
+            guide: [{
+              id: 'window',
+              order: 40,
+              title: () => t('guide.title'),
+              description: () => t('guide.description'),
+            }],
+          }), 'opendesign-member: right-bar tab type');
+
+          scoped.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+            name: 'sidebar.right.pane.tab',
+            key: TAB_ID,
+            locale: NS,
+          }, (props) => h(PanelBody, { ...props, t }))), 'opendesign-member: right-bar tab body');
+        });
       },
     };
   },

@@ -14,10 +14,10 @@
 | 工具 | 作用 |
 |---|---|
 | `opendesign_open` | 打开/复用**该成员自己的** OD 会话窗口，并与团队工作区、模型对齐 |
-| `opendesign_ask` | 跑一轮真实 OD 对话，**只返回该轮最终答复**；中间流式输出一律不返回。也可以用 `inject` 在任务进行中改口、用 `run_id` 事后收答案 |
+| `opendesign_ask` | **起一轮真实 OD 对话，默认 fire-and-forget**：OD 接受 run 就立刻返回收据（`runId` + `watcher`），不阻塞 Lead；答案之后由 watcher 推消息，再用 `run_id` 收（近乎瞬时）。也可以用 `inject` 在任务进行中改口。只有显式传 `timeout_ms` 才会在本次调用里等答案 |
 | `opendesign_inbox` | 取回**人在 OD 窗口里打的字**，以及 **OD 自己回的话**（桥接没发起的那轮）|
-| `opendesign_status` | 廉价地报告 daemon 状态、能力缺口、正在跑的 run、**该成员尚未取回的 run**、绑定与对齐 |
-| `opendesign_watch` | 起一个**常驻后台任务**盯住该成员会话的 run 状态；每次状态**变化**就追加一行到 job 输出，用 `job_output` 读、`job_kill` 停 |
+| `opendesign_status` | 廉价地报告 daemon 状态、能力缺口、正在跑的 run、**该成员尚未取回的 run**、绑定与对齐；若已知，还报告右栏复用的 web UI 地址（`web`）|
+| `opendesign_watch` | 起一个**常驻后台任务**盯住该成员会话的 run 状态；每次状态**变化**就追加一行到 job 输出**并直接推一条模型可见的消息**（不用轮询），同时让右栏自动刷新；`job_kill` 停 |
 
 **谁写文件：OD，不是你。** 这条值得单列，因为把它读错会让一次设计白做。OD 是这个团队的
 前端实现者——文件由它写，你负责给 brief、答它的表单、验它交付的东西。`opendesign_ask`
@@ -36,9 +36,44 @@ as described"），不是自己去写 SVG 或页面。
 - `toolCalls: 0` 且 `summary: ""` 是纯讨论，这一轮没碰任何东西
 - 字段缺失表示 run 的 events 日志读不到——**这是「未知」，不是「没动手」**
 
+**关键：你是要它干活的时候，传 `expect_files: true`。** 否则「只念了一遍方案」
+和「已经开始建文件」在返回体里长得一样——实测过：一轮 0 工具、一轮只读了 3 次，
+答复都像方案，Lead 因此以为已经开工。带上这个标志后，summary 会把话说死：
+
+```
+"this turn called NO tools — it only replied, so nothing was created or changed"
+"this turn called 3 tool(s) but changed NO files (Read×2, Bash) — it inspected, it did not build"
+"this turn called 2 tool(s) and CHANGED files (Write×2)"
+```
+
+日志读不到时仍然沉默——「看不到」不等于「没做」。
+
+`actions` 在**两步**里都有：起轮返回时（`timeout_ms` 等到结束），以及用 `run_id`
+收答案时。fire-and-forget 之后你只会走后者，所以这一步尤其重要。
+
 `opendesign_status` **默认不列模型表**：读一次 OD 的模型目录要 9–11 秒（OD 无服务端
 缓存），而模型目录已经按 CLI 缓存在磁盘上、设置面板也在用。要看模型就传
 `include_models: true`，或直接看插件详情页。
+
+## 默认不等：`opendesign_ask` 是 fire-and-forget
+
+**Lead 调完 `opendesign_ask` 就能继续下一件事。** 默认（不传 `timeout_ms`）下，
+OD 一接受 run 就返回收据：
+
+```json
+{"status":"queued","answer":"","runId":"…","stillRunning":true,
+ "durationMs":0,"watcher":{"jobId":"bash-…"}}
+```
+
+答案不会随这次调用返回；watcher 在 run 结束时会**推**一条消息（带 `run_id`），
+然后用 `opendesign_ask({ run_id })` 收，run 已结束的情况下是近乎瞬时的读。
+两者分工明确：
+
+- **默认**：起跑即返回 → Lead 继续干活 → 收到推送再收答案；
+- **`timeout_ms`**：显式要求「这次就等到答案」，仍受单次调用上限约束
+  （`turnTimeoutMs`，默认 600000ms）。
+- **收 `run_id`**：默认只等 15s（读一个已经在跑的东西），超时返回 `stillRunning`
+  并带上 live watcher 的 jobId。
 
 ## 安装
 
@@ -127,6 +162,25 @@ status:   run cad6f421 now running
 gone:     run cad6f421 is no longer live (was running) — its answer can be collected
 ```
 
+**状态变化会直接「推」给模型。** 除了写进 job 输出，每次真实状态变化还会通过
+`Agent.followup(...)` 投一条**模型可见的 user 消息**（`source.kind: "opendesign-watch"`），
+所以模型不需要自己想起来去 `job_output`——run 在没人盯的时候继续跑，正是它最需要被
+提醒的时刻。规则：
+
+- **只在 `report.changed` 时推**：`appeared` / `status` / `gone` 推；journal 增长的
+  `activity` 不推（理由同上一条，否则每 5 秒一条推送）。
+- **一批变化只推一条**。去重键是 `kind|runId|status`，同一个 transition 不会推第二次；
+  `gone` 用消失前那次的 runId，所以消息里仍带着收集答案的那次调用。
+- **`opendesign_ask` 自己等待的那一轮不会再被推一遍**：答案已经随这次工具调用返回，
+  同一次完成报两遍只会制造噪音（与 host 对 `settled.awaited` 的处理同一条道理）。
+  只有等待提前结束（`stillRunning`，答案还没交回）时，这一轮才交回给 watcher，
+  之后的 `gone` 会正常推送。job 输出里对应一行 `push skipped: this call already
+  carries that run's result`。
+- **文案是固定形状的短英文**：成员名 + 变化 + `opendesign_ask({ run_id: "<id>" })`，
+  不是 job 行原文；没有 runId 时不编造 id，也不带收集调用。
+- **拿不到推送通道时降级而不报错**：该 owner 没有 live agent（例如会话已结束）时，
+  watcher 照常轮询、照常写 job 输出，只追加一行 `model push unavailable: …` 说明原因。
+
 三个刻意的取舍：
 
 - **journal 增长不算「变化」**。thinking 阶段事件流一直在涨，若把它当成变化报出来，
@@ -135,8 +189,53 @@ gone:     run cad6f421 is no longer live (was running) — its answer can be col
   「有情况，去看」。第二个真相来源只会制造不一致。
 - **`gone` 本身是事件**。run 消失正是答案变得可取的那一刻，值得单独报一行。
 
-`stop_when_idle=true` 让它在连续两个周期没活 run 后自己收工；默认不收工，因为
-**后面才起的 run 同样需要被看见**。
+`opendesign_watch` 起的监视器**不会自己收工**：后面才起的 run 同样需要被看见，
+而「已经空闲」不足以判断「不会再有下一轮」。要停就 `job_kill`。
+
+它和 `opendesign_ask` 的守卫共用同一条权威判据
+（`GET /api/runs?conversationId=X&status=active`）：**一次查询**回答「这个会话在不在跑」。
+查询不到时它报 `unknown` 而不是猜测——判闲会重复起 turn，判忙会让成员永久卡住，
+两种猜测都有实际事故记录，所以这里只报第三种状态。
+
+## 右栏窗口：把 OD 嵌进 DSH（方案 F）
+
+DSH 的右栏可以开一个 **Open Design 窗口** 标签页，里面就是 OD 的**网页版**窗口，不用在
+两个应用之间来回切。它用的是 OD 0.26.1 自带的 web sidecar（同一份产品 UI、走 HTTP），
+不是 Electron 的 `od://` 原生窗口——后者浏览器打不开。
+
+怎么开：
+
+1. 会话里点右上角「打开右侧边栏」；
+2. 在 guide 页点「Open Design 窗口」；
+3. 标签页里是 `http://127.0.0.1:<webPort>/projects/<projectId>/conversations/<conversationId>`，
+   直接落在**该成员自己的会话**上（坐标来自桥接绑定）。
+
+实现与边界（都实测过）：
+
+- **端口是发现来的，不是写死的。** 先问 daemon 的 `GET /api/mcp/install-info` 的
+  `webBaseUrl`，再要求该地址 `GET /` 是 HTML **且** `GET /api/health` 是 JSON。
+  后半条是必须的：OD 同时开的内部 Next 后端也把 `/` 回成 HTML，但 `/api/*` 回 HTML、
+  不代理 daemon——嵌它等于嵌一个所有请求都失败的空壳。实测这台机器内部端口 64118、
+  web UI 64120，按端口升序扫描会正好选错。
+- **侧边栏复用 `opendesign_status` 的发现结果，不自己找端口。** 一次成功的发现
+  （daemon 地址 + web 地址）由插件共享：`opendesign_status` 在结果里直接报 `web`，
+  面板路由用同一份 `lastKnown`。即使 discovery 暂时失败（OD 重启中、进程表读不到），
+  面板会**回退到上一次确认过的地址**并标注「地址可能已过期」，而不是挂成找不到端口。
+- **后台监视有动作 → 侧边栏自动刷新。** watcher 观察到真实状态变化、以及新的 run 被
+  接受 / 答案被收时，Host 的 revision 计数器 +1；右栏每 2 秒读一次面板路由（一次
+  本地缓存读，十几毫秒），revision 变了就重载 iframe 并更新面板。人不用点任何按钮。
+  读取失败也会 2 秒后自动重试，不会一直停在错误页。
+- **降级要响。** 找不到 web UI、被 `X-Frame-Options` / `frame-ancestors` 拒绝、
+  或 daemon 不可达时，标签页显示原因并提供「在浏览器新标签打开」，**不会**留一个
+  空白 iframe。
+- **面板只读。** `/api/opendesign-member/panel` 只接受 GET，读坐标用 `peekTeam`：
+  打开面板不会顺带建项目 / 会话 / run。
+- **它和桥接是同一份数据。** 桥接起的 run（`clientType: desktop`）与网页版自己起的
+  run（iframe 里 `clientType: web`）在同一会话互相可见；实测消息逐字节一致。
+- **不会自动弹出来**：由人从右栏 guide 打开。OD 重启换了端口会自己换源。
+- **已知环境坑**：如果 Team 项目根目录是**巨大且活着的目录**（例如直接绑 `~/.dsh`），
+  OD 在 run 期间会长时间占满单线程 daemon，右栏里的会话区会一直转圈、`/api/runs`
+  也会超时。给 OD 一个真正的项目目录就正常（实测小项目里 run 状态在 5 秒内可见）。
 
 ## 任务进行中改口（`inject`）
 
@@ -190,6 +289,11 @@ gone:     run cad6f421 is no longer live (was running) — its answer can be col
   反复收集是安全的。只有你显式取消（或人在 OD 窗口按停止）才真正终止。
   **`runId` 丢了也不会丢答案**：那一轮会被记进 `bindings.json` 的 `pendingRun`，
   `opendesign_status` 在返回体顶层的 `pendingRun.collectWith` 里给出取回它需要的那一次调用。
+- **收答案不要用长等待。** `opendesign_ask({ run_id })` 的默认等待只有 **15 秒**
+  （只有「起新的一轮」才是 600 秒上限）：收集是读一个已经在跑的东西，而一旦有 watcher，
+  run 结束时会**推**一条消息把你叫醒，再收就是近乎瞬时的一次读。把 `timeout_ms`
+  设成几分钟去「等 OD 做完」，只会白白占住 Lead 的回合（实测一次 900000ms 的 collect
+  让调用方原地等了 6 分钟以上）。
 - **入站分两种。** `messages` 是人在窗口里打的字；`odReplies` 是 OD 自己的回答，
   且只报桥接没发起过的那些（人在窗口里暂停/纠偏时 OD 的回话）。只收人类消息时，
   人会看到「暂停」而看不到 OD 随后那一整段总结。
@@ -207,9 +311,10 @@ npm test        # 逐文件跑；不需要 Open Design 在运行
 ```
 
 测试只覆盖纯函数与单方法的可测导出（`awaitRun` / `readInbound` / `resolveSelection` /
-`BindingStore` / `planTurn` / `OdClient.probe`），不需要 Cordis、浏览器或 daemon。
-`index.js` 的工具注册与 `client.js` 的 React 渲染**不在自动化覆盖内**，改动这些需手工验证。
-详见 [`AGENTS.md`](./AGENTS.md)。
+`BindingStore` / `planTurn` / `OdClient.probe` / `createWatchNotifier`），不需要 Cordis、
+浏览器或 daemon；`watch-push.test.js` 另有源码级测试钉住推送在 watcher 的
+`report.changed` 分支内。`index.js` 的工具注册与 `client.js` 的 React 渲染**不在自动化
+覆盖内**，改动这些需手工验证。详见 [`AGENTS.md`](./AGENTS.md)。
 
 > `npm test` 用的是 `node --test "test/*.test.js"`。在部分沙箱里 `node --test` 起子进程会
 > 报 `spawn EPERM`；此时逐个跑 `node test/<file>.test.js` 等价，同样不需要 OD 在运行。

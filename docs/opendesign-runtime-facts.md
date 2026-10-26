@@ -502,3 +502,85 @@ PATH 或设 `VELA_BIN`，`amr` 立刻变 `available: true`。**这条对桌面�
   用它清理，不必拿归档凑合（`GET /api/projects/:id/archive` 是**打包下载 zip**，不是归档标记）。
    - **`runId` 丢了也能找回**（2026-10 补）。`stillRunning` 的那一轮会写进 `bindings.json` 的 `pendingRun`，`opendesign_status` 在返回体顶层如实回报，并带 `collectWith`——可直接照抄的那次 `opendesign_ask({ run_id })`。此前这个字段只写不读：一旦超时那一下丢了 `runId`，还在跑的那轮就**永久失联**，`bindings.json` 里有记录但没有任何工具开口。
    - 快速判断"OD 还在干活吗"：看 `opendesign_status` 的 `daemon.activeRunCount`。它是 daemon 级事实（`GET /api/runs/active-count`，2–4 ms），不依赖你有没有 `runId`。
+
+---
+
+## 14. 右栏嵌入：web sidecar、install-info 与深链（2026-10-26 实测）
+
+方案 F 的前提是「浏览器能打开一个真的是 OD 的页面」。本节是这条链路的**实测事实**；
+代码里的发现/降级逻辑（`discoverWebUi` / `frameBlocker` / `panelSnapshot`）都按这里写。
+
+### 14.1 OD 有两个 sidecar，端口都是随机的
+
+两个进程的 image 名都是 `Open Design.exe`（命令行分别指向
+`resources\app\prebundled\daemon\daemon-sidecar.mjs` 与 `...\web-sidecar.mjs`）：
+
+| 进程 | 角色 | 本次实测端口 | `GET /` | `GET /api/health` |
+|---|---|---|---|---|
+| daemon sidecar | JSON API | 64112 | 404 | 200 `application/json` |
+| **内部 Next 后端** | web 应用的 SSR 后端 | 64118 | 200 `text/html` | **200 `text/html`**（不代理 daemon） |
+| **web UI sidecar** | 产品网页版 | 64120 | 200 `text/html` | 200 `application/json`（代理到 daemon） |
+
+- **64118 是本轮最大的坑**：它 `/` 也是 HTML，按端口升序扫描会正好选中它，iframe 里
+  壳能开但所有 `/api/*` 请求都失败。**唯一可靠的判别是「`/` 是 HTML 且
+  `/api/health` 是 JSON」同时成立。**
+- 端口每次启动都变（本轮 web UI 还从 64120 换到过 64118 又换回来过），所以只能发现，
+  不能写死。
+
+### 14.2 权威地址：`GET /api/mcp/install-info`
+
+daemon 直接给出安装坐标（无需鉴权，约 860 B）：
+
+```json
+{ "daemonUrl": "http://127.0.0.1:64112",
+  "webBaseUrl": "http://127.0.0.1:64120",
+  "env": { "OD_DATA_DIR": "...", "OD_SIDECAR_CLIENT_ENDPOINT": "\\\\.\\pipe\\open-design-sidecar-…" },
+  "command": "...\\Open Design.exe", "cliExists": true, "nodeExists": true }
+```
+
+`webBaseUrl` 是唯一不会猜错的地址；拿到后仍然要用 14.1 的双判别验证一遍
+（旧的/被杀掉的 sidecar 可能还没退出）。没有 port 文件可读：`runtime.json` 只有版本，
+`logs\web\latest.log` 里的端口是内部后端的，会误导。
+
+### 14.3 web UI 的深链形状
+
+路径：`http://127.0.0.1:<webPort>/projects/<projectId>/conversations/<conversationId>`
+（项目级 `.../projects/<projectId>`）。服务端是 catch-all，任何路径都返回同一份 HTML
+壳，真正的路由由客户端按 `window.location.pathname` 解析；`/project/…/conversation/…`
+是错的形状，会落到首页。实测打开深链可渲染出对应工程与「设计文件」树。
+
+### 14.4 桥接与网页版是同一份数据
+
+- 桥接 `createRun` 带 `x-od-client: desktop` → run 的 `clientType: "desktop"`；
+  网页版自己发的 run 用 UA 嗅探（`navigator.userAgent.includes("Electron/") ? "desktop" : "web"`），
+  iframe 里是 `"web"`。
+- 实测经 web sidecar 的 `/api/projects` / conversations / messages 与 daemon 结果
+  **逐字节一致**，桥接的问答在网页版里可见；UI 不按 `clientType` 过滤。
+  → 「右栏里看不到自己会话」的风险不成立。
+
+### 14.5 iframe 可以嵌
+
+- `GET /` 与 `_next` 静态资源均无 `X-Frame-Options`、无 CSP `frame-ancestors`、
+  无 COOP/COEP；`server.js` 不做 Host/Origin 校验；没有 top-level-only API。
+- 在真实 DSH 页面（无头 Edge + CDP，真 cookie）里点开右栏 guide 的
+  「Open Design 窗口」，实际渲染出 iframe：
+  `src=http://127.0.0.1:64120/projects/<p>/conversations/<c>`，OD 网页版在右栏内可见。
+- `od://` 是 Electron 内部协议，浏览器打不开；OS 只注册了 `opendesign://`
+  （命令是外层 launcher，且只支持 invite/open，**没有聚焦会话的深链**）→ 降级按钮
+  不要用它，应该 `window.open` 网页地址。
+
+### 14.6 工程目录会影响 daemon 的响应性（本轮踩到）
+
+当 Team 项目根目录是 `C:\Users\Administrator\.dsh`（含几十个大目录、活着的会话数据）时，
+run 期间 daemon 会长时间占满单线程：`GET /api/runs?...&status=active` 在 10–15 s 超时，
+watcher 因此可能整轮看不到 `appearing` 状态。换成小工程目录
+（`review-opendesign\scratch-od-verify`，只有 1 个文件）后：
+run 状态 1 s 内可查、watcher 5 s 一轮两次变化都观察到了。
+**结论：给 OD 一个真正的项目目录，别把它绑到 `~/.dsh` 这种巨型活目录上。**
+
+### 14.7 清理
+
+- `DELETE /api/projects/:id` 本轮再次实测有效（`{"ok":true}`），删掉了验证用的
+  scratch 工程；删工程会先取消该工程名下的 run。
+- 消息仍然不能删：真实 Team 工程的会话里会留下本轮 `opendesign_ask` 的测试消息
+  （内容都是自包含的 short prompt，见 `DELIVERY-v0.4.0.md` 的 id 清单）。

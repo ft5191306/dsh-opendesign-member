@@ -11,3 +11,10 @@ Thumbs.db
 
 # This plugin's own runtime state, if anyone ever runs it in place
 *.pid
+
+# Test scratch. `DSH_TEST_TMP` lets a host that denies Node writes inside
+# `os.tmpdir()` point the throwaway directories somewhere writable — measured on
+# the Windows box this was developed on, where without it 17 tests failed with
+# EPERM from mkdtemp for environmental reasons. The default remains os.tmpdir();
+# this only keeps the override's directory out of git.
+.tmptest/

@@ -145,6 +145,113 @@ test('BindingStore: the pending question form round-trips and clears', async () 
   });
 });
 
+test('BindingStore: two stores writing different FIELDS of one member both survive', async () => {
+  await withTempDir(async ({ file }) => {
+    const path = file('bindings.json');
+    // ONE member, so there is no member key to tell the two writers apart: the
+    // merge has to be decided per field or one writer's work disappears.
+    const seed = new BindingStore(path);
+    seed.setMember('team-a', 'lead', { conversationId: 'conv-lead', projectId: 'p' });
+
+    // Both instances load before either writes. That is not a contrived race: it
+    // is what a concurrent `ask` + `inbox` looks like, because `opendesign_ask`
+    // records the bridge run (index.js:1853) while `opendesign_inbox` advances
+    // the cursor (index.js:2225), and each tool call builds its own store.
+    const ask = new BindingStore(path);
+    const inbox = new BindingStore(path);
+    ask.reload();
+    inbox.reload();
+    ask.noteBridgeRun('team-a', 'lead', 'run-1');
+    inbox.setCursor('team-a', 'lead', { id: 'msg-9', createdAt: 999 });
+
+    const onDisk = loadBindings(path).teams['team-a'].members.lead;
+    assert.deepEqual(onDisk.bridgeRuns, ['run-1'], 'the bridge run survives the cursor write');
+    // The cursor is the half that must never be lost: without it inbound
+    // delivery hands the same Open Design messages over again, which is the
+    // exactly-once property this document exists to hold.
+    assert.equal(onDisk.cursor?.id, 'msg-9', 'the cursor survives the bridge-run write');
+
+    // The worst-realistic shape: `opendesign_open` spreads a WHOLE member back
+    // through `setMember` to change only `model` (index.js:1483). That object
+    // carries a stale `cursor`, so a merge that claims every present key would
+    // roll the cursor back. Only the coordinates are claimed, so it does not.
+    const opener = new BindingStore(path);
+    const later = new BindingStore(path);
+    opener.reload();
+    later.reload();
+    const stale = opener.member('team-a', 'lead');
+    later.setCursor('team-a', 'lead', { id: 'msg-10', createdAt: 1_000 });
+    opener.setMember('team-a', 'lead', { ...stale, model: 'deepseek-v4.1-flash' });
+
+    const afterOpen = loadBindings(path).teams['team-a'].members.lead;
+    assert.equal(afterOpen.model, 'deepseek-v4.1-flash', 'the requested model lands');
+    assert.equal(afterOpen.cursor?.id, 'msg-10', 'a spread member does not roll the cursor back');
+    assert.deepEqual(afterOpen.bridgeRuns, ['run-1'], 'and keeps the bridge run');
+  });
+});
+
+test('BindingStore: a cleared pendingRun is not resurrected by another store\'s write', async () => {
+  await withTempDir(async ({ file }) => {
+    const path = file('bindings.json');
+    const seed = new BindingStore(path);
+    seed.setMember('team-a', 'lead', { conversationId: 'conv-lead', projectId: 'p' });
+    seed.notePendingRun('team-a', 'lead', { runId: 'run-9', startedAt: 123 });
+
+    // The clear is a DELETION, and a deletion has to be published like any other
+    // edit: replaying only present fields would let the disk copy restore the
+    // record, and a settled run would stay collectable forever.
+    const collector = new BindingStore(path);
+    const inbox = new BindingStore(path);
+    collector.reload();
+    inbox.reload();
+    inbox.setCursor('team-a', 'lead', { id: 'msg-9', createdAt: 999 });
+    collector.clearPendingRun('team-a', 'lead');
+
+    const afterClear = loadBindings(path).teams['team-a'].members.lead;
+    assert.equal(afterClear.pendingRun, undefined, 'a collected run is not written back from disk');
+    assert.equal(afterClear.cursor?.id, 'msg-9', 'the clear does not roll the cursor back');
+
+    // The other interleaving: the clear flushes first, then a store whose copy
+    // still remembers the run writes the cursor. That stale copy must contribute
+    // only the cursor.
+    seed.notePendingRun('team-a', 'lead', { runId: 'run-10', startedAt: 456 });
+    const collector2 = new BindingStore(path);
+    const inbox2 = new BindingStore(path);
+    collector2.reload();
+    inbox2.reload();
+    collector2.clearPendingRun('team-a', 'lead');
+    inbox2.setCursor('team-a', 'lead', { id: 'msg-10', createdAt: 1_000 });
+
+    const afterReorder = loadBindings(path).teams['team-a'].members.lead;
+    assert.equal(afterReorder.pendingRun, undefined, 'a stale copy does not write the run back');
+    assert.equal(afterReorder.cursor?.id, 'msg-10', 'the newer cursor still lands');
+  });
+});
+
+test('BindingStore: rebinding to a new conversation drops the old window\'s state', async () => {
+  await withTempDir(async ({ file }) => {
+    const path = file('bindings.json');
+    const store = new BindingStore(path);
+    store.setMember('team-a', 'lead', { conversationId: 'conv-old', projectId: 'p' });
+    store.setCursor('team-a', 'lead', { id: 'msg-old', createdAt: 1 });
+    store.notePendingRun('team-a', 'lead', { runId: 'run-old', startedAt: 2 });
+    store.setPendingForm('team-a', 'lead', { id: 'color' });
+
+    // `force_new` binds a brand-new conversation. The cursor, pending run, and
+    // pending form all name messages in the OLD one, so carrying them over would
+    // make the fresh window skip its first replies and offer an answer to a
+    // question it never asked. Whole-member replacement dropped them implicitly;
+    // the field merge has to drop them deliberately.
+    store.setMember('team-a', 'lead', { conversationId: 'conv-new', projectId: 'p' });
+
+    const onDisk = loadBindings(path).teams['team-a'].members.lead;
+    assert.equal(onDisk.conversationId, 'conv-new');
+    assert.equal(onDisk.cursor, undefined);
+    assert.equal(onDisk.pendingRun, undefined);
+    assert.equal(onDisk.pendingForm, undefined);
+  });
+});
+
 test('BindingStore: setters on an unknown member are no-ops rather than throwing', async () => {
   await withTempDir(async ({ file }) => {
     const store = new BindingStore(file('bindings.json'));

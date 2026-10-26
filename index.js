@@ -35,16 +35,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { defineTool } from './lib/tool.js';
 import {
-  discoverDaemon, OdClient, awaitRun, isTerminalRun, readInbound, splitQuestionForm,
+  discoverDaemon, discoverWebUi, OdClient, awaitRun, isTerminalRun, readInbound, splitQuestionForm,
   renderQuestionForm, composeFormAnswers, OdError,
 } from './lib/od-client.js';
 import { mintImportToken } from './lib/sidecar-token.js';
 import { BindingStore } from './lib/bindings.js';
 import { SettingsStore, resolveSelection, DEFAULT_MODEL } from './lib/settings.js';
 import { planTurn, composeRunMessage } from './lib/turn-plan.js';
-import { reconcileWatch, isSettledRun } from './lib/watch.js';
-import { observeRun, diffConversation } from './lib/conversation-watch.js';
+import { reconcileWatch, verdictFromActiveRuns, isSettledRun } from './lib/watch.js';
+import {
+  observeRun, observeConversation, diffConversation, isWorking, isTerminalStatus, latestUnfinishedRunId,
+} from './lib/conversation-watch.js';
 import { describeActions } from './lib/turn-actions.js';
+import { createWatchNotifier } from './lib/watch-push.js';
 
 /** Cordis plugin name. */
 export const name = 'opendesign-member';
@@ -67,6 +70,28 @@ const PACKAGE_NAME = '@local/dsh-opendesign-member';
 
 /** Host route the browser half reads and writes this bundle's settings through. */
 const SETTINGS_ROUTE = '/api/opendesign-member/settings';
+
+/**
+ * Host route the right-bar panel reads its state through.
+ *
+ * Separate from the settings route because the two answer different questions
+ * and have different freshness: settings are one standing choice for this side,
+ * while the panel is per-Session and must notice the web sidecar appearing or
+ * moving under an open tab.
+ */
+const PANEL_ROUTE = '/api/opendesign-member/panel';
+
+/**
+ * Default patience for a COLLECT call (`run_id` given, no new prompt), in ms.
+ *
+ * Collecting is a READ of work already in flight, not a request: blocking a whole
+ * turn on it stalls everything else the caller could be doing, and Open Design
+ * turns routinely run for minutes. A live watcher wakes the caller when the run
+ * settles, so this default is deliberately short — long enough that an answer
+ * which already landed is returned in one call, short enough that the caller is
+ * never parked on somebody else's work. An explicit `timeout_ms` still overrides.
+ */
+const COLLECT_DEFAULT_WAIT_MS = 15_000;
 
 /**
  * How long a probed model catalogue stays usable.
@@ -102,6 +127,14 @@ const CLI_DEFAULT_PROVIDER_LABEL = 'Open Design 官方';
  */
 const DEFAULTS = {
   baseUrl: '',
+  /**
+   * Explicit origin of Open Design's WEB app (the sidecar that serves the
+   * product UI over HTTP), used by the right-bar panel. Empty means "find the
+   * port the Open Design processes actually own": it is ephemeral, exactly like
+   * the daemon's, so the default is discovery rather than a number. Set it only
+   * when discovery cannot see the process (an unusual sandbox).
+   */
+  webUrl: '',
   // Empty means "follow the CLI Open Design currently has selected", read from
   // `app-config.agentId`. It is intentionally NOT a fixed agent: the human
   // switches Open Design's CLI from its own settings page, and a pinned id would
@@ -115,8 +148,19 @@ const DEFAULTS = {
   reasoning: '',
   sessionMode: 'chat',
   pollMs: 1000,
-  // Ten minutes is already generous for one design turn. Callers that truly need
-  // longer pass `timeout_ms` on that one call instead of raising this default.
+  /**
+   * How long `opendesign_ask` waits for a NEWLY STARTED turn, in milliseconds.
+   *
+   * Default **0 = do not wait**: the call returns as soon as Open Design accepts
+   * the run (a receipt with `runId` + `watcher`), and the caller continues with
+   * the next task. The answer arrives later as a pushed watcher message; collect
+   * it with `opendesign_ask({ run_id })`. A caller that genuinely wants the answer
+   * in the same call passes `timeout_ms`.
+   */
+  askStartWaitMs: 0,
+  // Upper bound on any single matching wait (explicit `timeout_ms` included):
+  // one tool call must never park a turn for longer than this. Turns that outlast
+  // it are simply collected later — the run is never cancelled.
   turnTimeoutMs: 600_000,
   /**
    * How often a background watcher polls Open Design, in milliseconds.
@@ -149,11 +193,13 @@ function resolveConfig(raw) {
   const flag = (key) => (typeof input[key] === 'boolean' ? input[key] : DEFAULTS[key]);
   return {
     baseUrl: text('baseUrl').trim(),
+    webUrl: text('webUrl').trim(),
     agentId: text('agentId').trim() || DEFAULTS.agentId,
     model: text('model').trim(),
     reasoning: text('reasoning').trim(),
     sessionMode: text('sessionMode').trim() || DEFAULTS.sessionMode,
     pollMs: Math.max(200, number('pollMs')),
+    askStartWaitMs: Math.max(0, number('askStartWaitMs')),
     turnTimeoutMs: Math.max(0, number('turnTimeoutMs')),
     watchIntervalMs: Math.max(500, number('watchIntervalMs')),
     instructions: text('instructions'),
@@ -186,11 +232,41 @@ function truncateUtf8(text, budget) {
   return { text: text.slice(0, low), truncated: true };
 }
 
+/**
+ * Surface capability gaps from a wait, without inventing any.
+ *
+ * `awaitRun` reports how it waited: an event stream normally, or a once-a-second
+ * polling loop when the daemon (or a proxy) does not serve one. That difference
+ * is a real cost difference and the project rule is that a degraded capability is
+ * REPORTED, not absorbed. Returning `{}` for the normal path keeps the field out
+ * of the answer entirely rather than filling it with `[]`, so "nothing was
+ * degraded" is distinguishable from "degradation was not reported".
+ *
+ * @param settled - the awaited run result.
+ */
+function degradedFrom(settled) {
+  const gaps = Array.isArray(settled?.degraded) ? settled.degraded.filter((gap) => gap !== undefined && gap !== null) : [];
+  return gaps.length === 0 ? {} : { degraded: gaps };
+}
+
 /** Deterministic project id for one Team, so re-binding finds the same project. */
 function teamProjectId(teamId) {
   const compact = String(teamId).replace(/[^A-Za-z0-9]/g, '').slice(0, 24);
   return `dsh-team-${compact || 'unknown'}`;
 }
+
+/**
+ * The newest run in a conversation that has not finished yet, from its message
+ * rows.
+ *
+ * Why the rows rather than the run LIST: measured against 0.26.1 (2026-10-26),
+ * `GET /api/runs?conversationId=…&projectId=…&status=active` answered
+ * `{"runs":[]}` for the whole life of a run that `GET /api/runs/:id` reported as
+ * `running`. The rows are the other way round — every assistant row carries
+ * `runId` and `runStatus` — so there is no window in which something is executing
+ * and the conversation cannot name it. The implementation lives in
+ * `lib/conversation-watch.js` (`latestUnfinishedRunId`) so it is unit-tested.
+ */
 
 /** Whether a value is a usable Open Design project id. */
 function isProjectId(value) {
@@ -241,7 +317,7 @@ function alignmentPolicy(config) {
   const model = config.model || 'the runtime default';
   return `Open Design is this Team's frontend/UI specialist, available through the \`opendesign_*\` tools.
 
-\`opendesign_ask\` runs one real Open Design turn and returns ONLY that turn's final answer; intermediate streaming output is never returned, so never quote partial output as a reply.
+\`opendesign_ask\` starts one real Open Design turn. **It is fire-and-forget by default**: the call returns as soon as Open Design accepts the run (a receipt with \`runId\` and a \`watcher\`), so keep working on the next task instead of blocking. The answer arrives later as a pushed watcher message; collect it with \`opendesign_ask({ run_id })\`, which is a near-instant read once the run has settled. Intermediate streaming output is never returned, so never quote partial output as a reply. Pass \`timeout_ms\` only when you genuinely need the answer inside the same call.
 
 Each Team member has their own real Open Design chat window, created by \`opendesign_open\` on first use. A new member always gets a fresh conversation, and windows are never shared between members or Teams. The human can read and steer the same conversation in the Open Design app.
 
@@ -277,8 +353,8 @@ What NOT to send it, because this is its craft rather than your constraint: resp
 Do not hand Open Design the acceptance-testing labour. Starting servers, waiting for health checks, driving a browser, and replaying your verification cases are YOUR work, not the designer's. An instruction to "verify it yourself end to end" turns one design turn into a long autonomous session: measured on this host, one such brief ran 36+ minutes with 64 shell calls and never returned an answer, so the caller blocked on nothing. Ask for the design; verify it yourself after it lands.
 
 When a turn keeps working past your wait:
-- A result with \`stillRunning: true\` means Open Design is STILL WORKING, not that it failed. The turn was not cancelled and its output is not lost.
-- Do not re-send the request and do not treat it as an error: collect the answer with \`opendesign_ask({ run_id })\` using that runId. Repeated collection calls are safe while it is still running.
+- A result with \`stillRunning: true\` (the normal receipt) means Open Design is STILL WORKING, not that it failed. The run was not cancelled and its output is not lost.
+- Do NOT poll and do NOT re-send the request: a pushed watcher message will name the settled run; then collect the answer with \`opendesign_ask({ run_id })\`. Repeated collection calls are safe but unnecessary while you have a watcher.
 - If you no longer have the runId, \`opendesign_status\` reports the run that member left in progress, with the exact call that collects it. Use that instead of asking again.
 - Only a cancellation from the human stops the turn. Never kill a design turn because it is slow.
 
@@ -350,6 +426,24 @@ const ASK_SCHEMA = {
      * Never read this as a failure, and never quote it as an answer.
      */
     stillRunning: { type: 'boolean' },
+    /**
+     * Capability gaps hit while waiting for this turn, as named entries. Empty or
+     * absent means the normal path.
+     *
+     * The one that matters in practice: when the daemon does not serve an event
+     * stream, the bridge falls back to POLLING `GET /api/runs/:id` once a second,
+     * which is correct but far more expensive. That downgrade is reported here
+     * rather than happening quietly — the project's rule is that a degraded
+     * capability must be visible, never silently absorbed. A caller seeing this
+     * can pass a larger `timeout_ms` knowingly instead of wondering why the call
+     * is slower than usual.
+     */
+    degraded: {
+      oneOf: [
+        { type: 'array', items: { type: 'object', additionalProperties: true } },
+        { type: 'null' },
+      ],
+    },
     /**
      * Present when this call started nothing because a turn was ALREADY running
      * in that conversation. Reports which run it found and how to collect it, so
@@ -426,6 +520,18 @@ const STATUS_SCHEMA = {
      * right even when this bridge's own record is missing.
      */
     watch: { type: 'object', additionalProperties: true },
+    /**
+     * The right-bar panel's web origin as last confirmed by this plugin
+     * (`{ baseUrl, discoveredBy, checkedAt }`), or null before the first
+     * successful discovery. Exposed so the sidebar can reuse the Lead's own
+     * status result instead of hunting for the port by itself.
+     */
+    web: {
+      oneOf: [
+        { type: 'object', additionalProperties: true },
+        { type: 'null' },
+      ],
+    },
     /**
      * The run this member left in progress, or null. Present so a run whose
      * answer was never collected can be found again after the caller lost its id.
@@ -514,6 +620,49 @@ export function apply(ctx, rawConfig = {}) {
   /** Lazily established daemon connection, shared by every tool. */
   let connection;
   /**
+   * Last known-good coordinates, shared by `opendesign_status` and the right-bar
+   * panel.
+   *
+   * The panel used to rediscover everything on its own and could show a hard
+   * failure ("cannot find the port") during an Open Design restart even when the
+   * Lead's own status call had just proved the address. One discovery result now
+   * feeds both: status reports it, the panel reuses it, and a stale entry is a
+   * fallback WITH an explicit reason instead of a dead end.
+   */
+  const lastKnown = {
+    /** Confirmed daemon origin from the latest successful connection. */
+    daemonUrl: undefined,
+    /** Latest embeddable web-UI discovery (`{ baseUrl, discoveredBy, checkedAt }`). */
+    web: undefined,
+  };
+  /**
+   * Monotonic counter bumped whenever Open Design state changes in a way the
+   * right-bar panel should show. The panel reads it through the panel route and
+   * reloads its frame when it moves, so "the background watcher saw something"
+   * turns into "the sidebar refreshed" without the browser scanning Open Design.
+   */
+  let panelRevision = 0;
+  const bumpPanelRevision = () => {
+    panelRevision += 1;
+  };
+  /**
+   * Remember one confirmed web-UI origin and notify the panel when it MOVES.
+   * Re-checking the same origin must not reload an embedded frame — that would
+   * throw away whatever the human was doing inside it.
+   */
+  function rememberWeb(result) {
+    if (result?.embeddable !== true || typeof result.baseUrl !== 'string') return false;
+    const moved = lastKnown.web?.baseUrl !== result.baseUrl;
+    lastKnown.web = {
+      baseUrl: result.baseUrl,
+      discoveredBy: result.discoveredBy,
+      embeddable: true,
+      checkedAt: result.checkedAt ?? new Date().toISOString(),
+    };
+    if (moved) bumpPanelRevision();
+    return moved;
+  }
+  /**
    * On-disk cache of model catalogues, one entry per CLI.
    *
    * Separate from the in-memory copy because the probe it saves costs 9–11
@@ -542,11 +691,15 @@ export function apply(ctx, rawConfig = {}) {
         const again = await discoverDaemon({ ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}) });
         // Keep the cached connection object so callers holding it stay valid.
         if (connection) connection.health = again.health;
+        lastKnown.daemonUrl = again.baseUrl;
         return again.baseUrl;
       },
     });
     od.health = found.health;
     connection = od;
+    // The panel and `opendesign_status` reuse this confirmed address instead of
+    // each running their own discovery pass (which is what could fail alone).
+    lastKnown.daemonUrl = found.baseUrl;
     return od;
   }
 
@@ -558,6 +711,25 @@ export function apply(ctx, rawConfig = {}) {
   async function client() {
     if (connection) return connection;
     return await connect();
+  }
+
+  /**
+   * Discover the web UI and remember the answer for the status/panel pair.
+   *
+   * Wrapped because BOTH sides need the same knowledge: `opendesign_status`
+   * reports it, the right-bar panel embeds it, and a rediscovery after an Open
+   * Design restart must move both without either doing its own probe.
+   *
+   * @param options - `daemonUrl` hint, `refresh` to bypass the short cache.
+   */
+  async function discoverWebUiShared(options = {}) {
+    const found = await discoverWebUi({
+      ...(config.webUrl.length > 0 ? { baseUrl: config.webUrl } : {}),
+      ...(options.daemonUrl === undefined ? {} : { daemonUrl: options.daemonUrl }),
+      ...(options.refresh === true ? { cache: false } : {}),
+    });
+    rememberWeb(found);
+    return found;
   }
 
   /**
@@ -832,42 +1004,117 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /**
-   * Read the run id a project says it is executing, if any.
+   * Build what the DSH right-bar panel shows for one Session.
    *
-   * Open Design keeps a per-project `status.runId`, and it is the one observation
-   * that survives BOTH a lost bridge record AND a conversation whose assistant row
-   * has not been written yet — the window where a caller concludes "nothing is
-   * happening" while a turn is streaming.
+   * Deliberately read-only: opening a right-bar tab must never provision a
+   * project, create a conversation, or start a run as a side effect of being
+   * looked at. A member with no bound conversation reports `conversationId:
+   * null`, and the panel says so instead of inventing one.
    *
-   * Note the asymmetry, verified against the live daemon: the LIST route carries
-   * `status`, the single-project route does NOT. Reading `GET /projects/:id` and
-   * looking for `status` silently yields nothing, which would make this guard look
-   * implemented while never firing.
+   * The Open Design surface a browser can actually display is the WEB sidecar
+   * (the daemon is JSON-only, the window people use is an Electron `od://`
+   * view). Whether that sidecar exists, and whether it may be framed at all, is
+   * discovered per call and reported with its reason — an empty iframe is not
+   * an acceptable answer.
    *
-   * @param od - connected client.
-   * @param projectId - the Team's project.
+   * @param sessionId - the Session whose member the panel is asking about.
+   * @param options - `refresh` bypasses the short web-UI discovery cache.
    */
-  async function liveProjectRun(od, projectId) {
-    const projects = await od.listProjects();
-    const project = projects.find((entry) => entry?.id === projectId);
-    const status = project?.status;
-    const runId = typeof status?.runId === 'string' ? status.runId : undefined;
-    if (runId === undefined || runId.length === 0) return undefined;
-    const value = typeof status?.value === 'string' ? status.value : undefined;
-    // A project can keep a stale runId after the run settled; the value is the
-    // field that says which state it is in.
-    if (value !== undefined && /^(succeeded|failed|canceled|cancelled|error|timeout|idle|done)$/i.test(value)) {
-      return undefined;
+  async function panelSnapshot(sessionId, options = {}) {
+    const agent = typeof sessionId === 'string' && sessionId.length > 0 ? ctx.agents.get(sessionId) : undefined;
+    const member = agent === undefined ? undefined : ctx.agentTeams.tryMembership(agent);
+    let projectId = null;
+    let conversationId = null;
+    if (member !== undefined) {
+      // Read-only lookup: peekTeam does not create a Team shell, so a panel poll
+      // never writes bindings.json (the same rule status follows).
+      const team = store.peekTeam(member.root.id);
+      const binding = team?.members?.[String(member.name)];
+      projectId = typeof team?.project?.projectId === 'string' ? team.project.projectId : null;
+      conversationId = typeof binding?.conversationId === 'string' && binding.conversationId.length > 0
+        ? binding.conversationId
+        : null;
     }
-    return { runId, status: value };
+
+    let daemonBaseUrl;
+    let daemonError;
+    try {
+      const od = await client();
+      daemonBaseUrl = od.baseUrl;
+    } catch (error) {
+      daemonError = error instanceof Error ? error.message : String(error);
+      // Reuse what the status path already proved. A transient discovery failure
+      // (Open Design restarting, a busy process table) must not turn the sidebar
+      // into a hard error while the Lead's own tool calls still know the address.
+      daemonBaseUrl = lastKnown.daemonUrl;
+    }
+
+    const discovered = await discoverWebUiShared({
+      // The daemon knows where its own web UI lives; ask it first, then let the
+      // discovery fall back to scanning the process's ports. The daemon origin
+      // is never a candidate for the UI (it answers JSON, not a document).
+      ...(daemonBaseUrl === undefined ? {} : { daemonUrl: daemonBaseUrl }),
+      ...(options.refresh === true ? { refresh: true } : {}),
+    });
+
+    // A transient discovery failure must not blank a panel that was working five
+    // seconds ago: reuse the last confirmed origin, but SAY it is stale instead
+    // of pretending it was just checked.
+    let resolved = discovered;
+    if (discovered.embeddable !== true && lastKnown.web !== undefined) {
+      resolved = {
+        ...lastKnown.web,
+        embeddable: true,
+        stale: true,
+        reason: `web UI discovery just failed (${discovered.reason ?? 'unknown reason'}); reusing the last known origin ${lastKnown.web.baseUrl}`,
+      };
+    }
+
+    // The web app's client router reads its initial state from the pathname:
+    // `<web>/projects/<projectId>/conversations/<conversationId>`. Reported as a
+    // PATH (not a URL) so the browser half composes it against whatever origin
+    // discovery just confirmed — the sidecar's port moves between launches.
+    const projectPath = projectId === null ? undefined : `/projects/${encodeURIComponent(projectId)}`;
+    const conversationPath = projectPath !== undefined && conversationId !== null
+      ? `${projectPath}/conversations/${encodeURIComponent(conversationId)}`
+      : projectPath;
+    const web = { ...resolved, ...(conversationPath === undefined ? {} : { deepLink: conversationPath }) };
+
+    return {
+      sessionId: typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : null,
+      member: member?.name ?? null,
+      role: member?.role ?? null,
+      projectId,
+      conversationId,
+      web,
+      daemon: {
+        reachable: daemonError === undefined,
+        baseUrl: daemonBaseUrl ?? null,
+        ...(daemonError === undefined ? {} : { error: daemonError }),
+      },
+      /**
+       * Monotonic "Open Design state changed" counter. The panel reloads its
+       * frame when this moves, which is how the background watcher's activity
+       * reaches the sidebar without the browser itself polling Open Design.
+       */
+      revision: panelRevision,
+      checkedAt: new Date().toISOString(),
+    };
   }
 
   /**
    * Find a run that is still live in one conversation, whatever started it.
    *
-   * Open Design does not serialise ordinary chat turns, so this is the only
-   * defence against two runs interleaving their history in one conversation. It
-   * deliberately looks at the CONVERSATION rather than at this bridge's own
+   * This is now the FALLBACK, not the primary: `GET /api/runs?conversationId=X&
+   * status=active` answers the same question authoritatively in one request, and
+   * `verdictFromActiveRuns` consumes it. This survives because (a) the run-create
+   * 409 path below needs to name the blocking run even when listRuns is
+   * unavailable, and (b) an older daemon that predates the filter still needs an
+   * answer. The previous `liveProjectRun` project-status heuristic was removed
+   * outright: once the authoritative query exists it could only add a second,
+   * weaker opinion, and it cost a `listProjects` on every call.
+   *
+   * It deliberately looks at the CONVERSATION rather than at this bridge's own
    * records: the turn that matters may have been started by a previous bridge
    * process, or by the human in the Open Design window.
    *
@@ -1042,6 +1289,32 @@ export function apply(ctx, rawConfig = {}) {
         requestBody: 'buffered',
         fetch: handler,
       }), 'opendesign-member.settingsRoute()');
+
+      /**
+       * Right-bar panel state. GET only, deliberately: looking at the panel must
+       * never be able to provision anything, so a crafted query string has
+       * nothing to write.
+       */
+      const panel = async (request) => {
+        try {
+          const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+          return reply({
+            ok: true,
+            value: await panelSnapshot(url.searchParams.get('session') ?? undefined, {
+              refresh: url.searchParams.get('refresh') === '1',
+            }),
+          });
+        } catch (error) {
+          return failure('opendesign-member/internal', error instanceof Error ? error.message : String(error));
+        }
+      };
+
+      scoped.effect(() => register({
+        path: PANEL_ROUTE,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: panel,
+      }), 'opendesign-member.panelRoute()');
     });
   }
 
@@ -1254,20 +1527,103 @@ export function apply(ctx, rawConfig = {}) {
     if (recorded !== undefined) {
       let live = false;
       try {
-        const view = jobs.get(recorded, input.owner);
+        const view = jobs.get(recorded.jobId, input.owner);
         live = view?.status === 'running' || view?.status === 'stopping';
       } catch {
         live = false;
       }
-      if (live) return { jobId: recorded, reused: true };
+      // The SAME live sets go back on the reuse path. A per-call set would be
+      // wrong: an ask that reuses an existing watcher must still be able to claim
+      // its own run, otherwise every ask after the first pushes its completed
+      // turn again.
+      if (live) {
+        // A new run started by THIS ask must become the thing the shared watcher
+        // follows, or a reused watcher would keep polling the run it already
+        // finished and never notice the one just started.
+        if (typeof input.seedRunId === 'string' && input.seedRunId.length > 0) recorded.seedRun?.(input.seedRunId);
+        return {
+          jobId: recorded.jobId,
+          reused: true,
+          selfHandled: recorded.selfHandled,
+          startedHere: recorded.startedHere,
+          seedRun: recorded.seedRun,
+        };
+      }
       // Remembered but gone: forget it so the new id replaces it.
       armed.delete(key);
     }
 
     const intervalMs = Number.isFinite(input.intervalMs) ? input.intervalMs : config.watchIntervalMs;
     const { projectId, conversationId, member, od } = input;
+    /**
+     * Run ids whose result the arming call is delivering (or waiting on) itself.
+     * Owned by the WATCHER, not by one call: the ask path adds its run when Open
+     * Design accepts it and removes it again if its wait ends while the run is
+     * still going, and every caller gets this same set back — including a caller
+     * that reused the live watcher. Pushing those runs would report one
+     * completion twice, so only the job record keeps them while they are here.
+     */
+    const selfHandled = new Set();
+    /**
+     * Run ids THIS process started through `opendesign_ask` (not through an
+     * explicit `opendesign_watch`, and not runs a human started in the Open Design
+     * window). Owned by the watcher and shared on the reuse path for the same
+     * reason `selfHandled` is.
+     *
+     * Why it exists: a fire-and-forget `ask` returns a receipt that ALREADY says
+     * `queued`/`running` for that run id. Pushing `appeared` for it repeats the
+     * receipt back to the caller as news, and it was measured doing exactly that:
+     * one ask produced three queued messages (receipt echo, `now unknown`,
+     * `was unknown`). The caller learns about this run from the ONE push that
+     * matters — its `gone`, when the answer is collectable. A run a human started
+     * in the window was never in a receipt, so its `appeared` is real news and is
+     * still pushed.
+     */
+    const startedHere = new Set();
     let previous;
     let lastProblem;
+    /**
+     * The run this watcher is currently following, discovered from the
+     * conversation because the daemon's run LIST is blind for this bridge's
+     * projects (see the measurement in the loop below).
+     *
+     * Seeded by the ask that arms the watcher (`seedRunId`), otherwise adopted
+     * from the newest unfinished message row, so a run a human started in the
+     * Open Design window is watched too. Cleared once the run settles, at which
+     * point the next poll re-discovers whatever is running now.
+     */
+    let knownRunId = typeof input.seedRunId === 'string' && input.seedRunId.length > 0
+      ? input.seedRunId
+      : undefined;
+    /**
+     * Make this watcher follow a run that was started AFTER it was armed.
+     *
+     * Necessary because `opendesign_ask` arms the watcher BEFORE it creates the
+     * run (so the watcher is watching from the first moment), and hands the run id
+     * back later — and a REUSED watcher was armed by an earlier call, so it would
+     * otherwise keep following that earlier run forever.
+     *
+     * @param runId - the run to follow from now on.
+     */
+    const seedRun = (runId) => {
+      if (typeof runId === 'string' && runId.trim().length > 0) knownRunId = runId;
+    };
+    // Status changes are PUSHED to the model, not only appended to the job
+    // output. The output ring is read only when the caller remembers to call
+    // `job_output`, and the moment a run continues unattended is exactly the
+    // moment nobody remembers — which is the failure this watcher exists to
+    // remove. The Agent is resolved on EVERY push (never captured here): a
+    // watcher outlives turns, and the agent that armed it may be disposed long
+    // before the run it is watching settles.
+    const notifier = createWatchNotifier({
+      resolveAgent: (sessionId) => ctx.agents.get(sessionId),
+      owner: input.owner,
+      member,
+      conversationId,
+    });
+    // Distinct push failures already explained in the job output. One line each,
+    // never one per poll: a watcher that spams its own degradation cannot be read.
+    let pushNotesShown = 0;
 
     const jobId = jobs.start({
       kind: 'bash',
@@ -1279,27 +1635,117 @@ export function apply(ctx, rawConfig = {}) {
           job.append(`watching ${member} conversation ${conversationId} every ${intervalMs}ms\n`);
           while (!stopped) {
             try {
-              const run = await findLiveRun(od, projectId, conversationId).catch(() => undefined);
-              const projectRun = run === undefined
-                ? await liveProjectRun(od, projectId).catch(() => undefined)
-                : undefined;
-              const live = run ?? projectRun;
-              const observation = observeRun(
-                live === undefined
-                  ? undefined
-                  : await od.getRun(live.runId).catch(() => ({ id: live.runId, status: live.status })),
-                undefined,
-              );
+              // WHAT IS RUNNING is discovered from the conversation's own message
+              // rows, then confirmed with `GET /api/runs/:id`.
+              //
+              // `GET /api/runs?…&status=active` looks like the authoritative answer
+              // and is not one for this bridge's projects. Measured against 0.26.1
+              // with a run genuinely `running` (2026-10-26): every filter
+              // combination — `conversationId`, `projectId`, both, `workspaceId` —
+              // answered `200 {"runs":[]}`, while `GET /api/runs/:id` for that same
+              // run answered `running` on every poll. Adding the `projectId` a
+              // Workspace-bound project requires only turned the earlier
+              // `400 PROJECT_SCOPE_REQUIRED` into an empty list. So the watcher read
+              // "no live run" for the whole life of every run: no `appeared`, no
+              // `gone`, nothing pushed — the exact silence this job exists to
+              // remove, and invisible because an empty list is a perfectly
+              // plausible answer.
+              //
+              // The message rows are where a run is actually named: every
+              // assistant row carries `runId` and `runStatus`, including a run a
+              // human started in the Open Design window (which the bridge could
+              // never learn any other way). They cost one request and are only
+              // read when no run is currently known, so the steady state of a long
+              // turn is a single cheap `getRun`.
+              if (knownRunId === undefined && conversationId !== undefined && projectId !== undefined) {
+                const rows = await od.listMessages(projectId, conversationId).catch(() => undefined);
+                if (Array.isArray(rows)) knownRunId = latestUnfinishedRunId(rows);
+              }
+              const observation = knownRunId === undefined
+                ? observeConversation({})
+                : observeRun(
+                  await od.getRun(knownRunId).then(
+                    (run) => ({ ...run, id: run?.id ?? knownRunId }),
+                    // A missing record means the run is over and was reaped; any
+                    // other failure is "could not look", which must stay quiet
+                    // rather than claim a completion.
+                    (error) => (error?.details?.status === 404 ? {} : { id: knownRunId, status: undefined }),
+                  ),
+                );
               const report = diffConversation(previous, observation);
               if (report.changed) {
                 job.append(`${new Date().toISOString()} ${report.kind}: ${report.message}\n`);
                 job.updateProgress(report.message);
+                // The right-bar panel listens for this counter: a real state change
+                // is exactly the moment its frame should reload, so the human sees
+                // the new run/answer without touching anything.
+                bumpPanelRevision();
                 // A status change means the caller should look at the output.
                 if (observation.runId !== undefined) {
                   job.append(`  → check the output: opendesign_ask({ run_id: "${observation.runId}" })\n`);
                 }
+                // ONE push per CHANGED BATCH, never per line: this whole block runs
+                // only when `diffConversation` reported a real change, so journal
+                // growth on a still-running turn can never become a notification.
+                // `previous` is still the observation before this batch; a `gone`
+                // report names a run that only `previous` knows the id of.
+                //
+                // A run this process started arrives with a RECEIPT that already
+                // said "queued/running", so while it is still WORKING there is
+                // nothing to add: its appearance and every queued→running style
+                // transition are the receipt echoed back as news. The one push that
+                // matters is the one where it stops working — `gone`, or a settled
+                // status — because that is when the answer can be collected. Runs the
+                // human starts in the Open Design window were never in a receipt, so
+                // their appearance is still pushed.
+                const changedRunId = observation.runId ?? previous?.runId;
+                const startedByThisCall = changedRunId !== undefined
+                  && startedHere.has(changedRunId)
+                  && isWorking(observation.status);
+                if (startedByThisCall) {
+                  job.append('  → push skipped: this call just started that run\n');
+                } else if (changedRunId !== undefined && selfHandled.has(changedRunId)) {
+                  // The caller is carrying that result back itself.
+                  job.append('  → push skipped: this call already carries that run\'s result\n');
+                } else {
+                  const pushed = notifier.notify(report, observation, previous);
+                  if (pushed.pushed === true) {
+                    job.append('  → pushed to the model\n');
+                  }
+                  // Degradation stays in the durable record: if the model cannot be
+                  // woken, the watcher keeps watching and explains itself once here.
+                  // `notify` never throws into this loop.
+                  const pushNotes = notifier.notes();
+                  while (pushNotesShown < pushNotes.length) {
+                    job.append(`  → model push unavailable: ${pushNotes[pushNotesShown]}\n`);
+                    pushNotesShown += 1;
+                  }
+                }
+                // `startedHere` only answers "was this run's appearance already
+                // known?", so it is released as soon as the run is over: gone, or
+                // observed in a terminal status. A watcher can live for days, and
+                // the set must not grow with every run of that week.
+                // `selfHandled` deliberately keeps its own lifetime — it answers a
+                // different question (has the caller already been given the answer?)
+                // and clearing it early would re-push a delivered turn.
+                if (changedRunId !== undefined
+                  && (report.kind === 'gone' || isSettledRun(observation))) {
+                  startedHere.delete(changedRunId);
+                }
               }
-              previous = observation;
+              // A run that is over must stop being the thing we poll, or the
+              // watcher would never notice the NEXT turn. Released when the run is
+              // no longer working (settled, or its record is gone): the next tick
+              // re-discovers whatever is running now. A failed lookup deliberately
+              // KEEPS the id — "could not look" is not "finished", and dropping it
+              // there would blind the watcher exactly when the daemon is busy.
+              if (observation.status !== 'unknown' && !isWorking(observation.status)) knownRunId = undefined;
+              // The baseline is only ever advanced by a DEFINITE observation.
+              // Otherwise a failed poll (`unknown`) becomes the thing the next
+              // poll is compared against, and recovery reports `gone (was
+              // unknown)` — a disappearance of a state that was never observed.
+              // Measured as two of the three queued messages one ask produced.
+              if (observation.status !== 'unknown') previous = observation;
               if (lastProblem !== undefined) {
                 job.append(`${new Date().toISOString()} recovered\n`);
                 lastProblem = undefined;
@@ -1325,8 +1771,8 @@ export function apply(ctx, rawConfig = {}) {
         };
       },
     });
-    armed.set(key, jobId);
-    return { jobId, reused: false };
+    armed.set(key, { jobId, selfHandled, startedHere, seedRun });
+    return { jobId, reused: false, selfHandled, startedHere, seedRun };
   }
 
   /**
@@ -1415,13 +1861,47 @@ export function apply(ctx, rawConfig = {}) {
     // Doing this after the wait would leave a window where a concurrent
     // `opendesign_inbox` could deliver the same answer twice.
     if (typeof input.onRunCreated === 'function') input.onRunCreated(runId);
+    // Patience is a caller choice, and ZERO means "do not wait at all": return a
+    // receipt the moment Open Design accepted the run. The run keeps going and the
+    // answer is reached through the watcher push plus `opendesign_ask({ run_id })`.
+    //
+    // The early return is REQUIRED, not an optimization: `awaitRun` treats
+    // `timeoutMs <= 0` as "no deadline" (it waits forever), so handing 0 to it
+    // would turn a fire-and-forget call into the longest possible block.
+    const waitBudgetMs = typeof input.waitBudgetMs === 'number' && Number.isFinite(input.waitBudgetMs)
+      ? input.waitBudgetMs
+      : config.askStartWaitMs;
+    const receipt = () => ({
+      runId,
+      status: typeof accepted.status === 'string' ? accepted.status : 'queued',
+      ok: true,
+      stillRunning: true,
+      text: '',
+      questionForm: null,
+      assistantMessageId: typeof accepted.assistantMessageId === 'string' ? accepted.assistantMessageId : null,
+      projectId: input.projectId,
+      conversationId: input.conversationId,
+      error: null,
+      errorCode: null,
+      retryable: false,
+      startedAt: typeof accepted.startedAt === 'number' ? accepted.startedAt : Date.now(),
+      settledAt: Date.now(),
+      actions: undefined,
+      degraded: [],
+      lastEventId: null,
+      effectiveAgentId: agentId,
+      effectiveModel: model,
+      effectiveReasoning: reasoning,
+    });
+    if (waitBudgetMs <= 0) return receipt();
     // Only the settled result is returned: intermediate streamed frames are
     // never collected, so a caller can never quote partial output. The wait
     // budget is a deadline on OUR patience only — it is passed as `timeoutMs`,
     // which reports `stillRunning` rather than cancelling the run.
     const settled = await awaitRun(od, runId, {
       pollMs: config.pollMs,
-      timeoutMs: typeof input.waitBudgetMs === 'number' ? input.waitBudgetMs : config.turnTimeoutMs,
+      // Belt and braces: a ceiling on one tool call, applied to explicit budgets.
+      timeoutMs: Math.min(waitBudgetMs, config.turnTimeoutMs > 0 ? config.turnTimeoutMs : waitBudgetMs),
       signal: input.signal,
     });
     // Report what this turn ACTUALLY ran with, not what a stale binding says.
@@ -1514,7 +1994,7 @@ export function apply(ctx, rawConfig = {}) {
       register(scoped.tools.register(defineTool({
         name: 'opendesign_ask',
         description:
-          'Run one Open Design turn and return ONLY that turn\'s final answer. Open Design is this Team\'s frontend implementer: it writes the files, and you brief it rather than building the UI yourself. Intermediate streaming output is never returned. Runs in the caller\'s own Open Design window unless `member` selects another member\'s window. Brief it in two parts: describe the need subjectively (intent, audience, tone, impression) and constrain with objective facts (stack, file layout, component/API interfaces, data schemas, formats). A reply with prose and no `questionForm` is a proposal waiting for you to say "go ahead" — send that as another turn; it does not hand the work to you.',
+          'Start one Open Design turn. By DEFAULT this is fire-and-forget: it returns as soon as Open Design accepts the run, with a receipt (`runId` plus the `watcher` jobId), so the Lead can continue with its next task instead of blocking. The answer arrives later as a pushed watcher message; collect it with `opendesign_ask({ run_id })` (a near-instant read once the run settled). Pass `timeout_ms` only when the answer is needed inside this call. Intermediate streaming output is never returned. Open Design is this Team\'s frontend implementer: it writes the files, and you brief it rather than building the UI yourself. Runs in the caller\'s own Open Design window unless `member` selects another member\'s window. Brief it in two parts: describe the need subjectively (intent, audience, tone, impression) and constrain with objective facts (stack, file layout, component/API interfaces, data schemas, formats). A reply with prose and no `questionForm` is a proposal waiting for you to say "go ahead" — send that as another turn; it does not hand the work to you.',
         parameters: {
           prompt: {
             type: 'string',
@@ -1534,11 +2014,15 @@ export function apply(ctx, rawConfig = {}) {
           },
           timeout_ms: {
             type: 'integer',
-            description: 'How long to wait for this turn to settle, in milliseconds. Defaults to the configured ceiling. Running out does NOT cancel the turn: the result reports stillRunning with its runId instead.',
+            description: 'How long to wait, in milliseconds. OMIT THIS unless you truly need the answer inside the call: a newly started turn returns a receipt immediately (runId + watcher) and the answer later arrives as a pushed message, so the Lead can keep working — collect it with opendesign_ask({ run_id }). Collecting an existing run_id waits 15000ms by default. Any explicit value is capped by the configured single-call ceiling. Running out does NOT cancel the run: the result reports stillRunning with its runId instead.',
+          },
+          expect_files: {
+            type: 'boolean',
+            description: 'Set this when you asked Open Design to BUILD something rather than to discuss it. The reply is prose either way, and prose that reads like a plan may come from a turn that called no tools at all. With this flag, `actions.summary` states plainly when a turn called no tools or changed no files, so "it only talked" cannot be mistaken for "it started building". Costs nothing: the tool-call count comes from the run\'s own journal.',
           },
           run_id: {
             type: 'string',
-            description: 'Collect the answer of a run that was still working when you stopped waiting. Pass the runId from a stillRunning result; do not send a prompt with it.',
+            description: 'Collect the answer of a run that is no longer waiting on you (the watcher push names its runId). Pass the runId from a stillRunning/receipt result; do not send a prompt with it. A short default wait (15000ms) applies: if the run has not settled, the result carries stillRunning plus the live watcher that will wake you, and a later call returns the answer almost instantly.',
           },
           inject: {
             type: 'string',
@@ -1566,9 +2050,14 @@ export function apply(ctx, rawConfig = {}) {
             ? args.member
             : member.name;
           const { binding } = await ensureConversation(od, member.root.id, targetMember, ensured.project);
-          const budget = typeof args.timeout_ms === 'number' && args.timeout_ms > 0
+          // Patience is per SHAPE. Starting a turn is fire-and-forget by DEFAULT
+          // (`askStartWaitMs = 0`): the call returns the moment Open Design accepts
+          // the run, and the answer arrives through the watcher push. Collecting is
+          // a short read (15s default). An explicit `timeout_ms` overrides either,
+          // bounded by the configured single-call ceiling.
+          const explicitBudget = typeof args.timeout_ms === 'number' && args.timeout_ms > 0
             ? args.timeout_ms
-            : config.turnTimeoutMs;
+            : undefined;
 
           // Submitting form answers is a distinct shape: Open Design only treats
           // the message as authoritative when it opens with the exact
@@ -1576,6 +2065,20 @@ export function apply(ctx, rawConfig = {}) {
           const answers = Array.isArray(args.form_answers) && args.form_answers.length > 0
             ? args.form_answers
             : undefined;
+
+          // Whether the caller asked for WORK (files) rather than a discussion.
+          //
+          // Measured 2026-10-26 in another session: two turns whose replies were
+          // plans, one of which called ZERO tools and one only `Bash`+`Read`, read
+          // to the Lead as if Open Design had started building. It had not. The
+          // prose cannot settle this; the journal can. When the caller says it
+          // expects work, a turn that touched nothing is stated instead of being
+          // reported with silence.
+          //
+          // Explicit argument first; otherwise inferred only when the call actually
+          // STARTS a turn (collecting a run cannot retroactively know the intent, and
+          // guessing would put a claim in the caller's mouth).
+          const wantsWork = args.expect_files === true;
           const remembered = store.member(member.root.id, targetMember)?.pendingForm;
 
           // What this call means is decided by `planTurn`, a pure function with
@@ -1585,35 +2088,78 @@ export function apply(ctx, rawConfig = {}) {
           // turn already running (measured — the turn finished with its original
           // answer, mentioning none of the correction), so pretending otherwise
           // would make every later status report a lie.
-          const recordedPendingRun = store.pendingRun(member.root.id, targetMember);
-          // Ask the daemon what this conversation is actually doing, instead of
-          // trusting this bridge's own record. The record is written only when a
-          // wait expires, so it is blind to a turn the human started in the Open
-          // Design window, to a turn started before a plugin reload, and to any
-          // turn whose write was lost. Three observations are reconciled first;
-          // `reconcileWatch` owns that decision and has its own tests.
-          let pendingRunStatus;
-          if (recordedPendingRun?.runId !== undefined) {
-            pendingRunStatus = await od.getRun(recordedPendingRun.runId).catch(() => undefined);
-            // Only a DEFINITE terminal status clears the record. A failed lookup
-            // is not evidence of settlement: while a long turn streams, this
-            // daemon can time out on `GET /api/runs/:id`, and dropping the record
-            // then loses the only pointer to a live run.
-            if (pendingRunStatus !== undefined && isSettledRun(pendingRunStatus)) {
-              store.clearPendingRun(member.root.id, targetMember);
+          //
+          // OBSERVATION IS A FUNCTION CALLED MORE THAN ONCE, and that is the fix
+          // for the inject defect rather than a tidiness choice. What this bridge
+          // believes about "is something running?" changes the moment it cancels
+          // something, so the question must be re-asked after the cancel. Measured
+          // before this shape existed, on a live run r1 with `inject`:
+          //
+          //   observe -> busy (r1) -> cancel r1 -> (no re-observe) -> guard reads
+          //   the stale verdict "busy" -> returns `adopted` naming r1, which this
+          //   call had just killed, and starts no new turn.
+          //
+          // Net effect was that 「改口」 only worked when there was nothing to
+          // redirect — the exact opposite of its purpose. Two of its three measured
+          // outcomes were "old run destroyed, nothing started" and "nothing happens".
+          const observe = async (exclude) => {
+            const recorded = store.pendingRun(member.root.id, targetMember);
+            let pendingStatus;
+            if (recorded?.runId !== undefined) {
+              pendingStatus = await od.getRun(recorded.runId).catch(() => undefined);
+              // Only a DEFINITE terminal status clears the record. A failed lookup
+              // is not evidence of settlement: while a long turn streams, this
+              // daemon can time out on `GET /api/runs/:id`, and dropping the record
+              // then loses the only pointer to a live run.
+              if (pendingStatus !== undefined && isSettledRun(pendingStatus)) {
+                store.clearPendingRun(member.root.id, targetMember);
+              }
             }
-          }
-          const conversationRun = await findLiveRun(od, ensured.project.projectId, binding.conversationId, [
-            recordedPendingRun?.runId,
-          ]).catch(() => undefined);
-          const projectRun = await liveProjectRun(od, ensured.project.projectId).catch(() => undefined);
-          const watch = reconcileWatch({
-            pendingRun: recordedPendingRun,
-            pendingRunStatus,
-            conversationRun,
-            projectRun,
-            activeRunCount: await od.activeRunCount(),
-          });
+            // What is running is read from the conversation's MESSAGE ROWS, then
+            // confirmed with `GET /api/runs/:id`.
+            //
+            // `GET /api/runs?…&status=active` looks like the authoritative answer
+            // and is not one for these projects. Measured against 0.26.1 with a run
+            // genuinely `running` (2026-10-26): every filter combination answered
+            // `{"runs":[]}`, while `GET /api/runs/:id` reported the truth. Adding
+            // the `projectId` a Workspace-bound project requires only turned a
+            // `400 PROJECT_SCOPE_REQUIRED` into an empty list — which reads exactly
+            // like "nothing is running" and made this guard silently miss every
+            // live run, then start a second turn over it.
+            //
+            // A failed lookup is `unknown`, never idle: see `verdictFromActiveRuns`.
+            const discoveredId = await od
+              .listMessages(ensured.project.projectId, binding.conversationId)
+              .then((rows) => latestUnfinishedRunId(rows))
+              .catch(() => undefined);
+            // The newest run the conversation names wins over the recorded one: a
+            // record only exists when a wait expired, so it is blind to a turn the
+            // human started in the Open Design window.
+            const candidateId = discoveredId ?? recorded?.runId;
+            const candidateStatus = candidateId === undefined
+              ? undefined
+              : await od.getRun(candidateId).catch(() => undefined);
+            const activeRuns = candidateId === undefined
+              ? []
+              : (candidateStatus === undefined || isSettledRun(candidateStatus)
+                ? []
+                : [{ id: candidateId, status: candidateStatus.status }]);
+            const conversationRun = undefined;
+            const activeRunCount = await od.activeRunCount().catch(() => undefined);
+            const watch = verdictFromActiveRuns({
+              activeRuns,
+              activeRunCount,
+              excludeRunIds: [
+                ...(pendingStatus !== undefined && isSettledRun(pendingStatus) ? [recorded.runId] : []),
+                ...(exclude ?? []),
+              ],
+            });
+            return { recorded, pendingStatus, conversationRun, watch };
+          };
+
+          const first = await observe();
+          const recordedPendingRun = first.recorded;
+          const pendingRunStatus = first.pendingStatus;
           // `pendingRunActive` is what the planner needs: true / false / unknown.
           const pendingRunActive = recordedPendingRun?.runId === undefined
             ? undefined
@@ -1649,6 +2195,11 @@ export function apply(ctx, rawConfig = {}) {
           // loses whatever it had not finished. `interrupted.answerSoFar` carries
           // the prose it had produced, so the caller can see what was traded.
           let interrupted;
+          // The pending verdict for the "should a new turn start?" guard below.
+          // It starts as the pre-cancel observation and is REPLACED after an
+          // interrupt, because cancelling is precisely the event that invalidates
+          // it. See the `observe` definition above for the failure this fixes.
+          let watch = first.watch;
           if (plan.interruptRunId !== undefined) {
             // Read the turn's partial output BEFORE cancelling: after the run
             // settles the daemon keeps the assistant message, but reporting what
@@ -1690,12 +2241,53 @@ export function apply(ctx, rawConfig = {}) {
             store.clearPendingRun(member.root.id, targetMember);
           }
 
+          // ── re-observe AFTER the cancel ──────────────────────────────────
+          //
+          // This is the whole fix for the inject defect: "should a new turn
+          // start?" is only a well-posed question after the thing that was
+          // running has been stopped. Asking it before is what produced the
+          // measured outcome `interrupted.runId === runId` — the call reported the
+          // run it had just killed as the one to go collect, and started nothing.
+          //
+          // The cancelled run is excluded from the conversation scan so it cannot
+          // be reported live a second time while the daemon finishes tearing it
+          // down. Any failure here is deliberately NOT fatal: a re-observation that
+          // could not be made leaves the original verdict in place, which at worst
+          // starts one speculative turn that the daemon refuses with 409.
+          if (plan.interruptRunId !== undefined) {
+            try {
+              const after = await observe([plan.interruptRunId]);
+              watch = after.watch;
+            } catch {
+              /* keep the pre-cancel verdict: a failed re-read must not fail the call */
+            }
+          }
+
           // ── collect: a READ of an existing run, sending nothing ───────────
           if (plan.kind === 'collect') {
             const resumeRunId = plan.runId;
+            // Tell the caller WHO will wake it if this short wait is not enough.
+            // A running watcher pushes when the run settles, so "still running"
+            // is never a dead end the model has to poll for.
+            const collectWatcher = (() => {
+              const jobs = typeof ctx.get === 'function' ? ctx.get('jobs') : undefined;
+              const entry = armed.get(`${exec.agent.session.id}:${binding.conversationId}`);
+              if (jobs === undefined || entry === undefined) return undefined;
+              try {
+                const view = jobs.get(entry.jobId, exec.agent.session.id);
+                return view?.status === 'running' || view?.status === 'stopping'
+                  ? { jobId: entry.jobId, reused: true }
+                  : undefined;
+              } catch {
+                return undefined;
+              }
+            })();
             const collected = await awaitRun(od, resumeRunId, {
               pollMs: config.pollMs,
-              timeoutMs: budget,
+              timeoutMs: Math.min(
+                explicitBudget ?? COLLECT_DEFAULT_WAIT_MS,
+                config.turnTimeoutMs > 0 ? config.turnTimeoutMs : Number.MAX_SAFE_INTEGER,
+              ),
               signal: exec.signal ?? new AbortController().signal,
             });
             if (collected.stillRunning === true) {
@@ -1710,9 +2302,14 @@ export function apply(ctx, rawConfig = {}) {
                 runId: resumeRunId,
                 durationMs: collected.settledAt - collected.startedAt,
                 stillRunning: true,
+                ...(collectWatcher === undefined ? {} : { watcher: collectWatcher }),
+                ...degradedFrom(collected),
               };
             }
             store.clearPendingRun(member.root.id, targetMember);
+            // The answer just became readable: reload the sidebar frame so it shows
+            // the finished turn instead of whatever it rendered before.
+            bumpPanelRevision();
             const resumed = truncateUtf8(collected.text, MAX_ANSWER_BYTES);
             if (collected.questionForm !== null) {
               store.setPendingForm(member.root.id, targetMember, {
@@ -1737,6 +2334,24 @@ export function apply(ctx, rawConfig = {}) {
               runId: resumeRunId,
               durationMs: collected.settledAt - collected.startedAt,
               stillRunning: false,
+              ...degradedFrom(collected),
+              // What the turn actually DID, from its own journal — the SAME field
+              // the start path reports.
+              //
+              // This is where it matters MOST, and where it was missing: a
+              // fire-and-forget ask returns a receipt, the answer arrives later by
+              // push, and the caller reads it with `run_id`. That collect path is
+              // the ONLY place a background turn's result is ever seen, and it was
+              // dropping `actions` — so a turn whose prose was a plan, but which had
+              // in fact written files, looked exactly like one that only talked. The
+              // caller then re-briefed work that had already been done, or believed
+              // nothing had happened. The reply text is not evidence; the journal is.
+              ...(collected.actions === undefined ? {} : {
+                actions: {
+                  ...collected.actions,
+                  summary: describeActions(collected.actions, { expectWork: wantsWork }),
+                },
+              }),
             };
           }
 
@@ -1759,17 +2374,21 @@ export function apply(ctx, rawConfig = {}) {
           // bridge process whose record was lost — was invisible here, and this
           // call would start a second one over it.
           //
-          // `watch` has already reconciled every source. When it says a turn is
-          // live, that turn wins: report it and how to collect it instead of
-          // starting another.
+          // `watch` has already reconciled every source, and if this call
+          // interrupted something it was re-observed AFTER the cancel (see above).
+          // When it says a turn is live, that turn wins: report it and how to
+          // collect it instead of starting another.
+          //
+          // ONLY `busy === true` blocks. `busy === null` is `state: 'unknown'` — a
+          // recorded run whose lookup failed — and it must PROCEED: blocking on it
+          // is what turned one unreadable run into a member that never sent
+          // anything again (measured, see `lib/watch.js`). The worst case of
+          // proceeding is one speculative turn, which the daemon refuses with 409.
           //
           // EXCEPT when this call carries FORM ANSWERS. Those are not a new
           // request: they are the reply to a question Open Design is blocked on,
-          // and dropping them strands the conversation. `watch.busy` can also be
-          // a false positive — an unreadable recorded run counts as busy by
-          // design — so a guard that refused to deliver answers would turn a
-          // conservative guess into a lost reply. Measured: after the guard was
-          // added, form answers never reached Open Design at all, and the same
+          // and dropping them strands the conversation. Measured: after the guard
+          // was added, form answers never reached Open Design at all, and the same
           // form came back on the next turn.
           if (watch.busy === true && plan.answersReply !== true) {
             return {
@@ -1798,9 +2417,14 @@ export function apply(ctx, rawConfig = {}) {
           // somehow still live in the conversation, delivering the answer alongside
           // it would put two runs in one history — so stop the stale one first.
           // Never cancel for a plain prompt: that case is handled by the guard
-          // below, which reports instead of destroying work.
+          // above, which reports instead of destroying work.
+          //
+          // Definite busy only. An `unknown` verdict cannot name a run to stop in
+          // the answer case — the only id it holds is the recorded one, which may
+          // already be settled — and cancelling a guess would destroy a live turn
+          // for nothing. The answer is still delivered either way.
           let answeredOverRun;
-          if (answers !== undefined && watch.busy === true) {
+          if (answers !== undefined && watch.busy === true && typeof watch.runId === 'string') {
             await od.cancelRun(watch.runId).catch(() => undefined);
             for (let i = 0; i < 40; i += 1) {
               const now = await od.getRun(watch.runId).catch(() => undefined);
@@ -1820,6 +2444,13 @@ export function apply(ctx, rawConfig = {}) {
           // first moment the run exists instead of being something a caller has to
           // remember. It is armed here rather than inside `runTurn` because this is
           // where the job registry and the session owner are both in scope.
+          //
+          // The run this call is waiting on is not NEWS: its answer arrives in
+          // this tool result, so pushing it too would report one completion twice
+          // (the same rule that makes `settled.awaited` suppress a duplicate job
+          // notification). The set is released below when the wait ends BEFORE
+          // the run settles — then the caller has not received the answer, and
+          // the watcher's push is the only way back to it.
           const armedWatcher = armWatcher({
             jobs: typeof ctx.get === 'function' ? ctx.get('jobs') : undefined,
             owner: exec.agent.session.id,
@@ -1829,6 +2460,21 @@ export function apply(ctx, rawConfig = {}) {
             member: targetMember,
             intervalMs: config.watchIntervalMs,
           });
+          // The live watcher owns these sets, and a REUSED watcher hands back the
+          // same ones: an ask that joins an already-running watcher must still be
+          // able to claim its own run, or every ask after the first would have
+          // its completed turn pushed back to it a second time.
+          const selfHandledRuns = armedWatcher?.selfHandled;
+          // Separate set, separate reason: this call's own receipt already says
+          // the run is queued/running, so an `appeared` push for it is the receipt
+          // echoed back as news. No entry means the run was started by someone
+          // else (the human in the Open Design window), whose appearance IS news.
+          const startedHereRuns = armedWatcher?.startedHere;
+          // The run this call INTERRUPTED was reported in the result itself
+          // (`interrupted: { status, cancelOrigin, answerSoFar }`), so the
+          // watcher's later `canceled` status would be the same fact twice. One
+          // turn of redirect produced one such push before this line existed.
+          if (interrupted?.runId !== undefined) selfHandledRuns?.add(interrupted.runId);
 
           const settled = await runTurn(od, {
             projectId: ensured.project.projectId,
@@ -1846,12 +2492,30 @@ export function apply(ctx, rawConfig = {}) {
             // work survived — a race, and the reason a timed-out turn kept
             // running afterwards with nobody able to collect it.
             signal: exec.signal ?? new AbortController().signal,
-            waitBudgetMs: budget,
+            waitBudgetMs: explicitBudget === undefined ? config.askStartWaitMs : explicitBudget,
             // Stamp the run as ours the moment Open Design accepts it, so
             // `opendesign_inbox` can tell this already-answered turn apart from
-            // one the human started in the window.
-            onRunCreated: (createdRunId) => store.noteBridgeRun(member.root.id, targetMember, createdRunId),
+            // one the human started in the window, and so the watcher knows this
+            // caller is already handling that run.
+            onRunCreated: (createdRunId) => {
+              store.noteBridgeRun(member.root.id, targetMember, createdRunId);
+              selfHandledRuns?.add(createdRunId);
+              // The receipt already reports this run; the watcher must not also
+              // announce its appearance (and must not push `now running` a moment
+              // later — the receipt named that status too).
+              startedHereRuns?.add(createdRunId);
+              // Tell the (possibly reused) watcher to follow THIS run: it was armed
+              // before the run existed, and a watcher reused from an earlier call
+              // would otherwise keep polling the run it already finished.
+              armedWatcher?.seedRun?.(createdRunId);
+              // A new run is visible state: the sidebar should reload its frame so
+              // the embedded Open Design window shows the turn that just started.
+              bumpPanelRevision();
+            },
           });
+          // Still running: this call did NOT deliver the answer, so release the
+          // run to the watcher — its settle is genuinely new information.
+          if (settled.runId !== undefined && settled.stillRunning === true) selfHandledRuns?.delete(settled.runId);
           store.noteTurn(member.root.id, targetMember, {
             event: answers !== undefined ? 'form-answers' : 'ask',
             runId: settled.runId,
@@ -1893,7 +2557,8 @@ export function apply(ctx, rawConfig = {}) {
               ...(answeredOverRun === undefined ? {} : { answeredOverRun }),
               // Most useful on this path: the caller has stopped waiting, and the
               // watcher is how it finds out the turn finished.
-              ...(armedWatcher === undefined ? {} : { watcher: armedWatcher }),
+              ...(armedWatcher === undefined ? {} : { watcher: { jobId: armedWatcher.jobId, reused: armedWatcher.reused } }),
+              ...degradedFrom(settled),
             };
           }
           if (!settled.ok && capped.text.length === 0 && settled.questionForm === null) {
@@ -1926,15 +2591,17 @@ export function apply(ctx, rawConfig = {}) {
             // could be delivered as their own turn.
             ...(answeredOverRun === undefined ? {} : { answeredOverRun }),
             // The watcher armed for this conversation, so the caller knows where to
-            // read status changes after this call returns.
-            ...(armedWatcher === undefined ? {} : { watcher: armedWatcher }),
+            // read status changes after this call returns. Only its wire shape is
+            // reported; the live `selfHandled` set stays inside the process.
+            ...(armedWatcher === undefined ? {} : { watcher: { jobId: armedWatcher.jobId, reused: armedWatcher.reused } }),
+            ...degradedFrom(settled),
             // What the turn actually DID, from its own journal. A reply that reads
             // like a proposal can be a run that already changed files, and the caller
             // needs that fact rather than an inference from the prose.
             ...(settled.actions === undefined ? {} : {
               actions: {
                 ...settled.actions,
-                summary: describeActions(settled.actions),
+                summary: describeActions(settled.actions, { expectWork: wantsWork }),
               },
             }),
           };
@@ -2033,12 +2700,16 @@ export function apply(ctx, rawConfig = {}) {
           // under `daemon`, because it is this Team's bookkeeping, not daemon state:
           // it is what makes such a run collectable after the caller lost its id.
           const pendingRun = team.members?.[member.name]?.pendingRun;
-          // What Open Design is ACTUALLY doing in this member's conversation,
-          // reconciled from the recorded run, the conversation, and the project's
-          // own status. This is the field that answers "is it working, or did my
-          // turn die?" without guessing from `pendingRun`, which is only written
-          // when a wait expires and is therefore blind to runs this bridge did not
-          // start.
+          // What Open Design is ACTUALLY doing in this member's conversation.
+          // One authoritative query, not three reconciled guesses. This is the
+          // field that answers "is it working, or did my turn die?" without
+          // guessing from `pendingRun`, which is only written when a wait expires
+          // and is therefore blind to runs this bridge did not start.
+          //
+          // Cost matters here: `opendesign_status` is documented as a cheap call on
+          // a hot path used for alignment checks, with a 46–63 ms baseline. A
+          // single filtered `GET /api/runs` keeps that; the old arrangement paid a
+          // message scan, up to five `getRun` calls, AND a `listProjects`.
           const watched = await (async () => {
             const od = await client().catch(() => undefined);
             if (od === undefined) {
@@ -2050,25 +2721,70 @@ export function apply(ctx, rawConfig = {}) {
             }
             const memberConversation = team.members?.[member.name]?.conversationId;
             const projectId = team.project?.projectId;
-            const conversationRun = projectId && memberConversation
-              ? await findLiveRun(od, projectId, memberConversation, [pendingRun?.runId]).catch(() => undefined)
-              : undefined;
+            const pendingStatus = pendingRun?.runId === undefined
+              ? undefined
+              : await od.getRun(pendingRun.runId).catch(() => undefined);
+            // Only a conversation can be asked what it is running. With no
+            // binding yet there is nothing to ask about.
+            //
+            // The conversation's MESSAGE ROWS are the source, not
+            // `GET /api/runs?…&status=active`: measured against 0.26.1 with a run
+            // genuinely `running`, that list answered `{"runs":[]}` for every
+            // filter combination, while `GET /api/runs/:id` reported the truth.
+            // The rows carry `runId`/`runStatus`, so the candidate id comes from
+            // there and `getRun` (or the recorded `pendingRun`) confirms it.
+            const discovered = memberConversation === undefined || projectId === undefined
+              ? undefined
+              : await od.listMessages(projectId, memberConversation)
+                .then((rows) => latestUnfinishedRunId(rows))
+                .catch(() => undefined);
+            const candidateId = discovered ?? pendingRun?.runId;
+            const liveStatus = candidateId === undefined
+              ? undefined
+              : await od.getRun(candidateId).catch(() => undefined);
+            if (candidateId !== undefined && liveStatus !== undefined && !isSettledRun(liveStatus)) {
+              return verdictFromActiveRuns({
+                activeRuns: [{ id: candidateId, status: liveStatus.status }],
+                excludeRunIds: pendingStatus !== undefined && isSettledRun(pendingStatus) && pendingRun?.runId
+                  ? [pendingRun.runId]
+                  : [],
+                ...(Number.isFinite(daemon.activeRunCount) ? { activeRunCount: daemon.activeRunCount } : {}),
+              });
+            }
+            // Nothing is definitively live. A recorded run that could not be read
+            // is still `unknown`, never idle — that is `reconcileWatch`'s job, and
+            // it is the only case that reaches here with anything to reconcile.
             return reconcileWatch({
               pendingRun,
-              pendingRunStatus: pendingRun?.runId === undefined
-                ? undefined
-                : await od.getRun(pendingRun.runId).catch(() => undefined),
-              conversationRun,
-              projectRun: projectId ? await liveProjectRun(od, projectId).catch(() => undefined) : undefined,
+              pendingRunStatus: pendingStatus,
+              conversationRun: projectId && memberConversation
+                ? await findLiveRun(od, projectId, memberConversation, [pendingRun?.runId]).catch(() => undefined)
+                : undefined,
               activeRunCount: Number.isFinite(daemon.activeRunCount) ? daemon.activeRunCount : undefined,
             });
           })();
+          // Share web-UI knowledge with the right-bar panel. Report what is
+          // already known, and warm it once in the BACKGROUND when it is not:
+          // the warm is deliberately not awaited, because `opendesign_status` is
+          // documented as a 46–63 ms call and discovery costs hundreds of ms.
+          if (lastKnown.web === undefined) {
+            void discoverWebUiShared({
+              ...(lastKnown.daemonUrl === undefined ? {} : { daemonUrl: lastKnown.daemonUrl }),
+            }).catch(() => undefined);
+          }
           return {
             member: member.name,
             role: member.role,
             daemon,
             project: team.project ?? {},
             members: Object.values(team.members),
+            /**
+             * The right-bar panel's web surface as last confirmed by this plugin.
+             * Reporting it here means the sidebar reuses the Lead's own discovery
+             * instead of probing on its own; `null` means "not discovered yet",
+             * never "not available".
+             */
+            web: lastKnown.web ?? null,
             /**
              * The live verdict: `state` is `busy` or `idle`, and a busy verdict
              * carries the run id plus `collectWith`. Replaces guessing from
@@ -2109,7 +2825,7 @@ export function apply(ctx, rawConfig = {}) {
       register(scoped.tools.register(defineTool({
         name: 'opendesign_watch',
         description:
-          'Start a LONG-LIVED background watcher on this member\'s Open Design conversation, and report its job id. It keeps running after this tool call returns and after the calling turn ends, polling the run status and appending a line to its job output every time that status CHANGES — queued, running, succeeded, failed, canceled. Read the lines with job_output. Stop it with job_kill. This is how you find out that a turn you stopped waiting for has finished: the job outlives the call that started it, which a per-call wait cannot.',
+          'Start a LONG-LIVED background watcher on this member\'s Open Design conversation, and report its job id. It keeps running after this tool call returns and after the calling turn ends, polling the run status. Every time that status CHANGES — queued, running, succeeded, failed, canceled — it both appends a line to its job output (read with job_output) and sends you a short user message naming the change, so you do not have to poll for it. Journal growth alone is not a change and is never reported. Stop it with job_kill. This is how you find out that a turn you stopped waiting for has finished: the job outlives the call that started it, which a per-call wait cannot.',
         parameters: {
           member: {
             type: 'string',
@@ -2118,10 +2834,6 @@ export function apply(ctx, rawConfig = {}) {
           interval_ms: {
             type: 'integer',
             description: 'How often to poll Open Design, in milliseconds. Defaults to the configured watch interval (5s). Slower is cheaper; faster only shortens the delay before a change is noticed.',
-          },
-          stop_when_idle: {
-            type: 'boolean',
-            description: 'When true, the watcher stops itself once the conversation has had no live run for one full interval after having seen one. Default false: it keeps watching so a turn started later is still noticed.',
           },
         },
         output: jsonOutput(WATCH_SCHEMA),
@@ -2181,8 +2893,8 @@ export function apply(ctx, rawConfig = {}) {
             intervalMs,
             watch: `long-lived: read its lines with job_output({ job_id: "${armedWatcher.jobId}" }), stop it with job_kill({ job_id: "${armedWatcher.jobId}" })`,
             note: armedWatcher.reused
-              ? 'A watcher was already running for this conversation and is reused — one job per conversation, so its output has no duplicated lines.'
-              : 'The job is running now and keeps polling after this call returns. It only READS Open Design, so a restarted daemon costs a retry rather than a provisioning wait. Every run-status change is appended to its output.',
+              ? 'A watcher was already running for this conversation and is reused — one job per conversation, so its output has no duplicated lines. It pushes status changes to you as well.'
+              : 'The job is running now and keeps polling after this call returns. It only READS Open Design, so a restarted daemon costs a retry rather than a provisioning wait. Every run-status change is appended to its output and also pushed to you as a short user message, so you do not need to poll job_output for it.',
           };
         },
       })));

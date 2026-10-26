@@ -6,12 +6,15 @@
  * reported `pendingRun: null`. The caller saw a tool that neither answered nor
  * failed, and read it as "stuck".
  *
- * Three invariants:
+ * Four invariants:
  *   1. A live run the daemon reports wins over a missing bridge record.
- *   2. "Could not look it up" leans towards BUSY — guessing idle there is what
- *      starts a duplicate turn.
+ *   2. A failed lookup is UNKNOWN — reported as its own third state, never
+ *      flattened into busy or idle. See the note on the unreadable-run test for
+ *      both measured consequences of getting this wrong.
  *   3. A verdict always names the run and how to collect it, so the caller never
  *      has to guess whether to collect or re-send.
+ *   4. `busy` stays present and boolean for the callers that only ask "is it
+ *      busy?" — `null` means unknown, and `=== true` is still the right test.
  */
 
 import test from 'node:test';
@@ -118,23 +121,56 @@ test('reconcileWatch: a recorded run wins when it is the one still live', () => 
   assert.equal(verdict.source, 'pendingRun');
 });
 
-test('reconcileWatch: an unreadable recorded run is treated as live, not finished', () => {
+test('reconcileWatch: an unreadable recorded run is UNKNOWN, not live and not finished', () => {
   const verdict = reconcileWatch({
     pendingRun: { runId: 'run-recorded' },
     // Lookup failed: status is undefined.
     pendingRunStatus: undefined,
   });
 
-  // Clearing the record on a failed lookup is exactly how the 2026-10-26 orphan
-  // happened: `GET /runs/:id` times out while a long turn streams, the record is
-  // dropped, and the next call starts a SECOND turn in the same conversation.
+  // The original version of this test asserted `state: 'busy'`, and its reasoning
+  // is preserved here because half of it was right:
   //
-  // So "unknown" leans towards busy. The cost of guessing busy is one extra
-  // collect call; the cost of guessing idle is a duplicated turn and lost work.
-  assert.equal(verdict.state, 'busy');
+  //   "Clearing the record on a failed lookup is exactly how the 2026-10-26 orphan
+  //    happened: `GET /runs/:id` times out while a long turn streams, the record is
+  //    dropped, and the next call starts a SECOND turn in the same conversation."
+  //
+  // Dropping the record is indeed wrong, and this verdict still does not drop it —
+  // `runId` and `collectWith` are still reported. What was wrong is the CHOICE OF
+  // TWO VALUES. Answering `busy` here is what caused the other measured failure on
+  // the same inputs: because `state`/`busy` is what `index.js` guards on, a lookup
+  // that keeps failing kept the guard armed forever, and every later
+  // `opendesign_ask` for that member returned `adopted` without sending anything —
+  // a permanently dead member, recoverable only by editing `bindings.json`.
+  //
+  // "Unknown" is the truthful answer and the one both callers can act on: the
+  // recorded id is reported so a possibly-live run is never lost, while permission
+  // to start a turn is granted because the daemon's own 409 RUN_IN_PROGRESS is a
+  // correct backstop and a permanent block has no backstop at all.
+  assert.equal(verdict.state, 'unknown');
+  assert.equal(verdict.busy, null);
   assert.equal(verdict.runId, 'run-recorded');
   assert.equal(verdict.status, 'unknown');
+  // Still collectable: the pointer to the run survives even though the state is
+  // not known.
+  assert.equal(verdict.collectWith, 'opendesign_ask({ run_id: "run-recorded" })');
   assert.match(verdict.note, /could not read the recorded run/);
+});
+
+test('reconcileWatch: a live run outranks an unreadable recorded run', () => {
+  // Unknown must not mask a run the daemon could actually see: reporting one
+  // `unknown` while another observation says `busy` would throw away the only
+  // definite fact in hand, and with it the id worth collecting.
+  const verdict = reconcileWatch({
+    pendingRun: { runId: 'run-recorded' },
+    pendingRunStatus: undefined,
+    conversationRun: { runId: 'run-live', status: 'running' },
+  });
+
+  assert.equal(verdict.state, 'busy');
+  assert.equal(verdict.busy, true);
+  assert.equal(verdict.runId, 'run-live');
+  assert.equal(verdict.source, 'conversation');
 });
 
 test('reconcileWatch: a settled recorded run leaves the bridge idle', () => {
