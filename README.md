@@ -5,7 +5,11 @@
 每个 DSH 团队成员绑定一个**真实**的 Open Design 会话窗口：消息双向流通，窗口粒度是
 成员级（新成员即新窗口），工作区与模型自动对齐。
 
-## 四个工具
+当前版本 **0.3.0**。可见行为的变化记在 [CHANGELOG.md](CHANGELOG.md)；OD 的实测行为
+（端口、重启、表单协议、崩了去哪看日志）在
+[docs/opendesign-runtime-facts.md](docs/opendesign-runtime-facts.md)。
+
+## 五个工具
 
 | 工具 | 作用 |
 |---|---|

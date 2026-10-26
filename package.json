@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-opendesign-member",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Bind DSH team members to real Open Design conversations",
@@ -21,7 +21,8 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
-    "AGENTS.md"
+    "AGENTS.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "test": "node scripts/test.js",
